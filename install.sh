@@ -28,8 +28,8 @@ sed "s|{{HOME}}|$HOME|g" "$SCRIPT_DIR/ai.mlx.server.plist.template" > "$PLIST_FI
 
 # 5. Load LaunchAgent
 echo "[4/4] Starting service via launchctl..."
-launchctl bootout "gui/$(id -u)/ai.mlx.server" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE" 2>/dev/null || launchctl load "$PLIST_FILE" 2>/dev/null || true
+launchctl unload "$PLIST_FILE" 2>/dev/null || true
+launchctl load "$PLIST_FILE"
 
 echo "✔ Installation complete!"
 echo "Check status with: mlx status"
