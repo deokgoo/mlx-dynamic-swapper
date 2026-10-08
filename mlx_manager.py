@@ -28,6 +28,10 @@ PORT_THINKER_INTERNAL = int(os.environ.get("PORT_THINKER_INTERNAL", 18236))
 PROXY_PORT_CODER = int(os.environ.get("PROXY_PORT_CODER", 1234))
 PROXY_PORT_COMPACT = int(os.environ.get("PROXY_PORT_COMPACT", 1235))
 PROXY_PORT_THINKER = int(os.environ.get("PROXY_PORT_THINKER", 1236))
+PROXY_PORT_LAYA = int(os.environ.get("PROXY_PORT_LAYA", 1237))
+
+# Laya (typed-decision model, ~658MB) — resident service, no swap needed
+LAYA_MODEL_PATH = os.environ.get("LAYA_MODEL_PATH", os.path.expanduser("~/.mlx-models/laya-multilingual-mlx"))
 
 # Log Directory & Files
 LOG_DIR = os.environ.get("MLX_LOG_DIR", os.path.expanduser("~/.mlx-server"))
@@ -684,14 +688,129 @@ async def proxy_thinker(request: Request, path: str):
     return await generic_proxy(request, path, PORT_THINKER_INTERNAL)
 
 
+# ── App 4: Port 1237 (Laya Typed-Decision Service, resident) ─────
+# Laya is a small (~658MB) typed-decision model: single forward pass,
+# no text generation. It runs RESIDENT (no swap) alongside the LLMs.
+app_laya = FastAPI(title="Laya Typed-Decision Service")
+
+laya_agent = None
+laya_agent_error = None
+laya_lock = asyncio.Lock()
+
+
+def _load_laya():
+    """Load the Laya agent. Returns (agent, error)."""
+    global laya_agent, laya_agent_error
+    if laya_agent is not None:
+        return laya_agent, None
+    if not os.path.isdir(LAYA_MODEL_PATH):
+        laya_agent_error = f"model directory not found: {LAYA_MODEL_PATH}"
+        return None, laya_agent_error
+    try:
+        import laya_mlx
+        t0 = time.time()
+        laya_agent = laya_mlx.load(LAYA_MODEL_PATH)
+        print(f"[MLX Manager] Laya agent loaded from {LAYA_MODEL_PATH} in {time.time()-t0:.1f}s", flush=True)
+        return laya_agent, None
+    except Exception as e:
+        laya_agent_error = str(e)
+        print(f"[MLX Manager] Laya load failed: {e}", flush=True)
+        return None, laya_agent_error
+
+
+@app_laya.get("/health")
+@app_laya.get("/status")
+async def laya_health():
+    agent, err = _load_laya()
+    return {
+        "status": "ok" if agent else "error",
+        "service": "laya",
+        "model": LAYA_MODEL_PATH,
+        "loaded": agent is not None,
+        "error": err,
+    }
+
+
+@app_laya.get("/v1/models")
+async def laya_models():
+    agent, _ = _load_laya()
+    return {
+        "object": "list",
+        "data": [{
+            "id": "laya-multilingual",
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "laya_mlx",
+            "loaded": agent is not None,
+        }],
+    }
+
+
+@app_laya.get("/v1/presets")
+async def laya_presets():
+    """Built-in typed question presets (triage/email/guard/moderation/router)."""
+    try:
+        from laya_mlx import (
+            email_questions, guard_questions, moderation_questions,
+            router_questions, triage_questions,
+        )
+        return {
+            "triage": triage_questions(),
+            "email": email_questions(),
+            "guard": guard_questions(),
+            "moderation": moderation_questions(),
+            "router": router_questions(),
+        }
+    except Exception as e:
+        return Response(content=json.dumps({"error": str(e)}), status_code=500, media_type="application/json")
+
+
+@app_laya.post("/v1/predict")
+async def laya_predict(request: Request):
+    """Typed decisions: {state: str|dict, questions: {id: {type, instructions, criteria?}}}"""
+    agent, err = _load_laya()
+    if agent is None:
+        return Response(
+            content=json.dumps({"error": f"laya not loaded: {err}"}),
+            status_code=503, media_type="application/json",
+        )
+    try:
+        payload = await request.json()
+    except Exception:
+        return Response(content=json.dumps({"error": "invalid JSON body"}), status_code=400, media_type="application/json")
+
+    state = payload.get("state")
+    questions = payload.get("questions")
+    if state is None or not questions:
+        return Response(
+            content=json.dumps({"error": "required fields: state, questions"}),
+            status_code=400, media_type="application/json",
+        )
+
+    async with laya_lock:
+        t0 = time.time()
+        try:
+            result = agent.predict(state, questions)
+        except Exception as e:
+            return Response(
+                content=json.dumps({"error": f"prediction failed: {e}"}),
+                status_code=500, media_type="application/json",
+            )
+    result["latency_ms"] = round((time.time() - t0) * 1000, 2)
+    return result
+
+
 async def main():
-    print("[MLX Manager] Starting 3-Model MLX Dynamic Swapper...", flush=True)
+    print("[MLX Manager] Starting 3-Model MLX Dynamic Swapper + Laya service...", flush=True)
     # Aggressively kill ANY leftover mlx servers from previous runs to guarantee clean slate
     kill_rogue_mlx_servers()
     await asyncio.sleep(0.5)
     async with swap_lock:
         # Start Thinker (Qwen3.8-27B) as default primary model on boot
         await _start_thinker_unlocked()
+
+    # Load Laya resident (small, no swap) — non-blocking
+    asyncio.create_task(asyncio.to_thread(_load_laya))
 
     config_coder = uvicorn.Config(
         app_coder,
@@ -711,24 +830,32 @@ async def main():
         port=PROXY_PORT_THINKER,
         log_level="warning"
     )
+    config_laya = uvicorn.Config(
+        app_laya,
+        host="127.0.0.1",
+        port=PROXY_PORT_LAYA,
+        log_level="warning"
+    )
 
     server_coder = uvicorn.Server(config_coder)
     server_compact = uvicorn.Server(config_compact)
     server_thinker = uvicorn.Server(config_thinker)
+    server_laya = uvicorn.Server(config_laya)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown_all(server_coder, server_compact, server_thinker)))
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown_all(server_coder, server_compact, server_thinker, server_laya)))
 
-    print(f"[MLX Manager] Proxies listening: Coder on {PROXY_PORT_CODER}, Compactor on {PROXY_PORT_COMPACT}, Thinker on {PROXY_PORT_THINKER}", flush=True)
-    await asyncio.gather(server_coder.serve(), server_compact.serve(), server_thinker.serve())
+    print(f"[MLX Manager] Proxies listening: Coder on {PROXY_PORT_CODER}, Compactor on {PROXY_PORT_COMPACT}, Thinker on {PROXY_PORT_THINKER}, Laya on {PROXY_PORT_LAYA}", flush=True)
+    await asyncio.gather(server_coder.serve(), server_compact.serve(), server_thinker.serve(), server_laya.serve())
 
 
-async def shutdown_all(s1: uvicorn.Server, s2: uvicorn.Server, s3: uvicorn.Server):
+async def shutdown_all(s1: uvicorn.Server, s2: uvicorn.Server, s3: uvicorn.Server, s4: uvicorn.Server):
     print("[MLX Manager] Shutting down manager and stopping MLX processes...", flush=True)
     s1.should_exit = True
     s2.should_exit = True
     s3.should_exit = True
+    s4.should_exit = True
     async with swap_lock:
         await _stop_coder_unlocked()
         await _stop_compact_unlocked()
