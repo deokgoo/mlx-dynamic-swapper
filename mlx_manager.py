@@ -800,6 +800,68 @@ async def laya_predict(request: Request):
     return result
 
 
+@app_laya.post("/v1/chat/completions")
+async def laya_chat_completions(request: Request):
+    """OpenAI-compatible shim so Laya appears as a model in Hermes.
+
+    Takes the last user message as `state`, runs a default triage question
+    set, and returns the typed decisions as a chat-completion message.
+    (Laya is a typed-decision model, not a text generator — the 'content'
+    is a JSON rendering of the decisions.)
+    """
+    agent, err = _load_laya()
+    if agent is None:
+        return Response(
+            content=json.dumps({"error": f"laya not loaded: {err}"}),
+            status_code=503, media_type="application/json",
+        )
+    try:
+        payload = await request.json()
+    except Exception:
+        return Response(content=json.dumps({"error": "invalid JSON body"}), status_code=400, media_type="application/json")
+
+    messages = payload.get("messages", [])
+    state = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            state = m.get("content")
+            break
+    if state is None:
+        return Response(content=json.dumps({"error": "no user message found"}), status_code=400, media_type="application/json")
+
+    # Default triage question set (overridable via payload["questions"])
+    questions = payload.get("questions") or {
+        "intent": {"type": "choice", "instructions": "이 문의의 의도는?",
+                   "criteria": ["billing", "technical_help", "refund", "information", "cancellation", "other"]},
+        "is_urgent": {"type": "noul", "instructions": "긴급 처리가 필요한가?"},
+        "frustration": {"type": "noul", "instructions": "고객의 불만/좌절 정도?"},
+    }
+
+    async with laya_lock:
+        t0 = time.time()
+        try:
+            result = agent.predict(state, questions)
+        except Exception as e:
+            return Response(
+                content=json.dumps({"error": f"prediction failed: {e}"}),
+                status_code=500, media_type="application/json",
+            )
+
+    content = json.dumps(result.get("answers", result), ensure_ascii=False)
+    return {
+        "id": f"chatcmpl-laya-{int(time.time()*1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "laya-multilingual",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": result.get("usage", {"input_tokens": 0, "output_tokens": 0}),
+    }
+
+
 async def main():
     print("[MLX Manager] Starting 3-Model MLX Dynamic Swapper + Laya service...", flush=True)
     # Aggressively kill ANY leftover mlx servers from previous runs to guarantee clean slate
