@@ -658,7 +658,10 @@ async def generic_proxy(request: Request, path: str, internal_port: int, timeout
 
                 c = re.sub(r"(## Completed Actions\s*\n)(.*?)(?=\n## |\Z)", collapse_completed_actions, c, flags=re.DOTALL)
 
-                # 3. Append strict architectural constraints
+                # 3. Collapse bloated Detailed Session Log (Turn 1..N) to eliminate 17,000+ chars of bloat
+                c = re.sub(r"(## Detailed Session Log[^\n]*\n)(.*?)(?=\n## |\Z)", r"\1- Historical session turns consolidated into active state for compactness.\n", c, flags=re.DOTALL)
+
+                # 4. Append strict architectural constraints
                 if "[CRITICAL ARCHITECTURAL CONSTRAINTS FOR COMPACTION" not in c:
                     c += STRUCTURED_COMPACTION_CONSTRAINTS
 
