@@ -11,6 +11,7 @@ COMPACT_ERR="$HOME/.mlx-server/compaction.error.log"
 
 PORT_MAIN=1234
 PORT_COMPACT=1235
+PORT_LAYA=1236
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -21,6 +22,10 @@ NC='\033[0m' # No Color
 
 is_running() {
     lsof -i :$PORT_MAIN -sTCP:LISTEN >/dev/null 2>&1
+}
+
+is_laya_running() {
+    lsof -i :$PORT_LAYA -sTCP:LISTEN >/dev/null 2>&1
 }
 
 get_manager_pid() {
@@ -78,37 +83,58 @@ stop_mlx() {
 
 status_mlx() {
     M_PID=$(get_manager_pid)
-    PID_MAIN=$(get_main_pid)
-    PID_COMPACT=$(get_compact_pid)
 
     if [ -n "$M_PID" ] && is_running; then
         echo -e "${BOLD}MLX Dynamic Swapper:${NC} ${GREEN}ONLINE${NC} (Manager PID: $M_PID)"
-        echo -e "  Main Endpoint:       http://127.0.0.1:${PORT_MAIN}/v1"
-        echo -e "  Compaction Endpoint: http://127.0.0.1:${PORT_COMPACT}/v1"
+        echo -e "  Main (Qwen3.6-35B-A3B):       http://127.0.0.1:${PORT_MAIN}/v1"
+        echo -e "  Compactor (Qwen2.5-7B):       http://127.0.0.1:${PORT_COMPACT}/v1"
+        if is_laya_running; then
+            echo -e "  Laya Endpoint:                ${GREEN}http://127.0.0.1:${PORT_LAYA}/v1 (resident)${NC}"
+        else
+            echo -e "  Laya Endpoint:                ${YELLOW}DISABLED (ENABLE_LAYA=0)${NC}"
+        fi
         echo ""
 
-        if [ -n "$PID_MAIN" ]; then
-            RSS=$(ps -o rss= -p "$PID_MAIN" 2>/dev/null | tr -d ' ')
+        # Try getting live active models from swapper API
+        STATUS_JSON=$(curl -s --max-time 1 "http://127.0.0.1:${PORT_MAIN}/status" 2>/dev/null)
+        ACTIVE_NAME=""
+        ACTIVE_PID=""
+
+        if [ -n "$STATUS_JSON" ]; then
+            ACTIVE_NAME=$(echo "$STATUS_JSON" | python3 -c 'import sys, json; data=json.load(sys.stdin); print(data.get("active_models", [{}])[0].get("name", ""))' 2>/dev/null)
+            ACTIVE_PID=$(echo "$STATUS_JSON" | python3 -c 'import sys, json; data=json.load(sys.stdin); print(data.get("active_models", [{}])[0].get("pid", ""))' 2>/dev/null)
+        fi
+
+        # Fallback to process search if API did not return model
+        if [ -z "$ACTIVE_PID" ] || [ "$ACTIVE_PID" = "None" ]; then
+            PID_MAIN=$(get_main_pid)
+            PID_COMPACT=$(get_compact_pid)
+            if [ -n "$PID_MAIN" ]; then
+                ACTIVE_NAME="Qwen3.6-35B-A3B (Main, 18234)"
+                ACTIVE_PID="$PID_MAIN"
+            elif [ -n "$PID_COMPACT" ]; then
+                ACTIVE_NAME="Compaction Model (7B, 18235)"
+                ACTIVE_PID="$PID_COMPACT"
+            fi
+        fi
+
+        if [ -n "$ACTIVE_PID" ] && [ "$ACTIVE_PID" != "None" ]; then
+            RSS=$(ps -o rss= -p "$ACTIVE_PID" 2>/dev/null | tr -d ' ')
             RAM_MB=$((RSS / 1024))
-            echo -e "  ${BOLD}Active Model:${NC}       ${GREEN}Main Model (27B)${NC}"
-            echo -e "  Status:             Running (PID: $PID_MAIN, RAM: ${RAM_MB}MB, Prompt Cache: 6GB)"
-        elif [ -n "$PID_COMPACT" ]; then
-            RSS=$(ps -o rss= -p "$PID_COMPACT" 2>/dev/null | tr -d ' ')
-            RAM_MB=$((RSS / 1024))
-            echo -e "  ${BOLD}Active Model:${NC}       ${YELLOW}Compaction Model (7B)${NC}"
-            echo -e "  Status:             Running (PID: $PID_COMPACT, RAM: ${RAM_MB}MB, Full VRAM)"
+            echo -e "  ${BOLD}Active Model:${NC}       ${GREEN}${ACTIVE_NAME}${NC}"
+            echo -e "  Status:             Running (PID: ${ACTIVE_PID}, RAM: ${RAM_MB}MB)"
         else
             echo -e "  ${BOLD}Active Model:${NC}       ${YELLOW}Standby (Swapping on demand)${NC}"
         fi
-        echo -e "  Auto-Swap Mode:     Active (Main unloads on compaction, Compaction runs, then Main restores)"
+        echo -e "  Auto-Swap Mode:     Active (Dynamically swapped between Main & Compactor)"
     else
-        echo -e "Status: ${RED}OFFLINE${NC} (Ports ${PORT_MAIN}/${PORT_COMPACT} free, RAM usage: 0MB)"
+        echo -e "Status: ${RED}OFFLINE${NC} (Ports free, RAM usage: 0MB)"
     fi
 }
 
 logs_mlx() {
     echo -e "${CYAN}Tailing MLX Server & Manager logs (Ctrl+C to exit)...${NC}"
-    tail -f "$MANAGER_LOG" "$SERVER_LOG" "$COMPACT_LOG"
+    tail -f "$MANAGER_LOG" "$HOME/.mlx-server/main.log" "$HOME/.mlx-server/main.error.log" "$COMPACT_LOG"
 }
 
 health_mlx() {
@@ -123,6 +149,42 @@ health_mlx() {
         echo "DOWN"
         return 1
     fi
+}
+
+laya_mlx() {
+    # mlx laya "prompt" [--preset triage|email|guard|moderation|router]
+    local prompt="$1"; shift || true
+    local preset=""
+    if [ "$1" = "--preset" ]; then
+        preset="$2"; shift 2 || true
+    fi
+    if [ -z "$prompt" ]; then
+        echo "Usage: mlx laya \"<text>\" [--preset <name>]"
+        echo "  presets: triage, email, guard, moderation, router"
+        return 1
+    fi
+    local url="http://127.0.0.1:${PORT_LAYA}/v1/predict"
+    local body
+    if [ -n "$preset" ]; then
+        body=$(python3 -c "
+import json, sys, urllib.request
+state, preset = sys.argv[1], sys.argv[2]
+try:
+    presets = json.load(urllib.request.urlopen('http://127.0.0.1:${PORT_LAYA}/v1/presets', timeout=10))
+except Exception as e:
+    sys.exit(f'failed to fetch presets: {e}')
+q = presets.get(preset)
+if q is None:
+    sys.exit('unknown preset: ' + preset + ' (available: ' + ', '.join(presets) + ')')
+print(json.dumps({'state': state, 'questions': q}))
+" "$prompt" "$preset") || { echo "$body"; return 1; }
+    else
+        body=$(python3 -c "
+import json, sys
+print(json.dumps({'state': sys.argv[1], 'questions': {'decision': {'type': 'noul', 'instructions': 'Is this actionable/urgent?'}}}))
+" "$prompt")
+    fi
+    curl -s --max-time 30 -X POST "$url" -H "Content-Type: application/json" -d "$body" | python3 -m json.tool
 }
 
 case "$1" in
@@ -143,11 +205,15 @@ case "$1" in
     health)
         health_mlx
         ;;
+    laya)
+        shift
+        laya_mlx "$@"
+        ;;
     logs|log)
         logs_mlx
         ;;
     *)
-        echo "Usage: mlx {start|stop|restart|status|health|logs}"
+        echo "Usage: mlx {start|stop|restart|status|health|laya|logs}"
         exit 1
         ;;
 esac
