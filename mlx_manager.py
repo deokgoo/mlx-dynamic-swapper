@@ -64,18 +64,19 @@ PREFILL_STEP_SIZE = os.environ.get("PREFILL_STEP_SIZE", "512")
 
 STRUCTURED_COMPACTION_CONSTRAINTS = (
     "\n\n========================================\n"
-    "[CRITICAL ARCHITECTURAL CONSTRAINTS FOR COMPACTION]\n"
-    "1. ABSOLUTELY FORBIDDEN: Do NOT output turn-by-turn or chronological event logs (e.g. 'Turn 1: ...', 'Turn 2: ...', 'Step 1: ...', 'Assistant called tool...', 'User asked...'). Do NOT narrate past history chronologically.\n"
-    "2. MANDATORY 4-SECTION SYNTHESIS: You MUST synthesize the active conversation state directly into these 4 concise sections:\n"
+    "[CRITICAL ARCHITECTURAL CONSTRAINTS FOR COMPACTION — HIGHEST PRIORITY]\n"
+    "1. ABSOLUTELY FORBIDDEN: Do NOT output turn-by-turn logs or long numbered action lists (e.g. '1. READ...', '2. PATCH...', 'Turn 1...', 'Turn 80...').\n"
+    "2. MANDATORY COLLAPSE OF HISTORICAL ACTIONS: If the previous summary contains a long list of numbered actions (e.g. 1..80), DO NOT PRESERVE OR REPRODUCE THEM. You MUST collapse all historical actions into at most 3-5 concise bullet points.\n"
+    "3. MANDATORY 4-SECTION SYNTHESIS: Distill the active conversation state directly into these 4 concise sections:\n"
     "   ## 1. Core Goal & User Intent\n"
     "   - Primary objectives, user preferences, and scope of work.\n"
     "   ## 2. Current Architecture & Code State\n"
-    "   - Concrete list of modified files, created files, active services, config parameters, and environment state. (Always include exact paths).\n"
+    "   - Concrete list of modified files, created files, active services, config parameters, and environment state. (Include exact paths).\n"
     "   ## 3. Discovered Facts & Issues\n"
     "   - Root causes identified, bugs resolved, and any active blockers or errors still requiring resolution.\n"
     "   ## 4. Next Immediate Steps\n"
     "   - Prioritized bullet points of the exact next actions to take.\n"
-    "3. DENSITY & BREVITY: Keep the total summary under 1,200 tokens. Group repetitive tool actions into a single summary bullet. Focus strictly on CURRENT STATE, not past historical steps.\n"
+    "4. STRICT TOKEN BUDGET: Total output MUST be under 500 words (~600 tokens). High density, zero fluff, zero timeline duplication.\n"
     "========================================\n"
 )
 
@@ -627,7 +628,7 @@ async def generic_proxy(request: Request, path: str, internal_port: int, timeout
 
         if is_compaction:
             chat_template_kwargs["enable_thinking"] = False
-            print("[MLX Proxy] 🗜️ Context compaction detected -> Force thinking OFF & inject structured 4-section constraints", flush=True)
+            print("[MLX Proxy] 🗜️ Context compaction detected -> Force thinking OFF & inject structured anti-bloat constraints", flush=True)
             messages = _data.get("messages", [])
             target_msg = None
             for m in reversed(messages):
@@ -638,8 +639,30 @@ async def generic_proxy(request: Request, path: str, internal_port: int, timeout
                 target_msg = messages[-1]
 
             if target_msg and isinstance(target_msg.get("content"), str):
-                if "[CRITICAL ARCHITECTURAL CONSTRAINTS FOR COMPACTION]" not in target_msg["content"]:
-                    target_msg["content"] += STRUCTURED_COMPACTION_CONSTRAINTS
+                c = target_msg["content"]
+                # 1. Neutralize Hermes prompt directive that forces continuing the numbered list
+                if "ADD new completed actions to the numbered list" in c:
+                    c = c.replace(
+                        "ADD new completed actions to the numbered list (continue numbering).",
+                        "CONDENSE all historical actions into at most 3-5 high-level bullet points. NEVER copy or continue long numbered lists!"
+                    )
+
+                # 2. Collapse bloated historical action lists inside PREVIOUS SUMMARY to stop prompt explosion
+                def collapse_completed_actions(match):
+                    header = match.group(1)
+                    actions = match.group(2).strip().splitlines()
+                    if len(actions) > 5:
+                        collapsed = actions[:2] + [f"... [{len(actions)-4} earlier actions collapsed for brevity] ..."] + actions[-2:]
+                        return header + "\n".join(collapsed) + "\n"
+                    return match.group(0)
+
+                c = re.sub(r"(## Completed Actions\s*\n)(.*?)(?=\n## |\Z)", collapse_completed_actions, c, flags=re.DOTALL)
+
+                # 3. Append strict architectural constraints
+                if "[CRITICAL ARCHITECTURAL CONSTRAINTS FOR COMPACTION" not in c:
+                    c += STRUCTURED_COMPACTION_CONSTRAINTS
+
+                target_msg["content"] = c
 
         _data["chat_template_kwargs"] = chat_template_kwargs
 
