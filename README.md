@@ -50,6 +50,32 @@ Apple Silicon의 통합 메모리 구조(Unified Memory)는 강력하지만, 36G
 
 ### 🔄 동작 아키텍처 (Architecture Flow)
 
+#### 🧱 Inbound Request Pipeline (A ➔ B ➔ C 레이어 체인)
+Hermes Agent와 MLX 모델 사이에서 들어오는 모든 요청 페이로드는 `PayloadFilter` 트레이트를 구현한 5단계 독립 레이어를 순차 통과하며 안전하게 가공·정제됩니다:
+
+```mermaid
+flowchart LR
+    In["Hermes Request"] --> L1["1. ModelRoute<br>(로컬 경로 매핑)"]
+    L1 --> L2["2. ThinkingNormalizer<br>(effort 표준화)"]
+    L2 --> L3["3. CompactionInterceptor<br>(요약 제약 주입)"]
+    L3 --> L4["4. UniversalToolGuard<br>(단/복수 파라미터 교정)"]
+    L4 --> L5["5. AntiLoopGuard<br>(직전 실패 반복 차단)"]
+    L5 --> Out["MLX Model Backend"]
+```
+
+| 순서 | 레이어 명칭 | 담당 역할 및 책임 |
+| :---: | :--- | :--- |
+| **1** | **`ModelRouteFilter`** | 클라이언트가 요청한 모델명을 실제 로컬 가중치 경로로 강제 일치화 |
+| **2** | **`ThinkingNormalizerFilter`** | Hermes의 `reasoning_effort`를 MLX/Qwen 템플릿 표준(`enable_thinking`, `xhigh`/`medium`)으로 정규화 |
+| **3** | **`CompactionInterceptorFilter`** | 컨텍스트 요약 요청 감지 시 Thinking을 끄고 4섹션 고밀도 압축 제약조건 주입 |
+| **4** | **`UniversalToolGuardFilter`** | 도구 스키마 대조를 통한 단/복수형 파라미터 자동 교정 및 이중 문자열화 JSON 언패킹 |
+| **5** | **`AntiLoopGuardFilter`** | 직전 도구 실패 감지 시 `[ANTI-LOOP GUARD]` 런타임 가이드를 동적 주입하여 반복 루프 차단 |
+
+> 💡 **새로운 레이어 추가 방법 (OCP 준수)**:  
+> `src/pipeline/` 아래에 `PayloadFilter` 트레이트를 구현한 구조체를 만들고, `RequestPipeline::build_default()`에 `Box::new(MyNewFilter)`를 등록하기만 하면 기존 코드를 일절 건드리지 않고 새로운 방어/가공 레이어를 무한히 확장할 수 있습니다.
+
+---
+
 #### 🛡️ Universal Tool-Call Guard & Self-Correction Engine (범용 도구 호출 자동 교정)
 에이전트(Hermes 등)가 긴 컨텍스트에서 도구를 호출할 때 발생하는 오타 및 동일 실패 무한 반복 루프를 프록시 계층에서 자동으로 차단합니다:
 1. **범용 단/복수형 파라미터 매퍼 (Fuzzy Parameter Resolver)**:
@@ -225,6 +251,19 @@ python3 ~/.mlx-server/bin/comfy_swap.py edit \
 - **Zero-copy SSE Streaming**: Ultra-low latency token forwarding directly from Metal backend to client.
 - **POSIX Process Supervision**: Guaranteed 100% Metal memory reclamation via `setsid` and `nix::killpg`.
 - **Thinking Unleashed**: Full reasoning support (`xhigh` / `medium`) alongside native MTP drafting at **43.7 tok/s**.
+
+---
+
+### 🧱 Inbound Request Pipeline (A ➔ B ➔ C Layer Chain)
+
+Every request from Hermes Agent passes sequentially through an extensible chain of `PayloadFilter` layers before reaching the model:
+1. **`ModelRouteFilter`**: Maps requested model name to local weights path.
+2. **`ThinkingNormalizerFilter`**: Normalizes `reasoning_effort` to template standard.
+3. **`CompactionInterceptorFilter`**: Enforces strict 4-section synthesis constraints for context compaction.
+4. **`UniversalToolGuardFilter`**: Automatically resolves singular/plural tool arguments and unwraps stringified JSONs.
+5. **`AntiLoopGuardFilter`**: Dynamically injects anti-loop directives if the previous tool call failed.
+
+*Extensibility*: Simply implement `PayloadFilter` and register it in `RequestPipeline::build_default()` to add new interceptors without modifying existing pipeline code.
 
 ---
 

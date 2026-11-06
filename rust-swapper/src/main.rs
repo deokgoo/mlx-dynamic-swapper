@@ -5,7 +5,7 @@
 
 mod comfy;
 mod config;
-mod payload;
+mod pipeline;
 mod process;
 mod proxy;
 
@@ -31,6 +31,7 @@ pub struct AppState {
     pub http_client: Client,
     pub swap_lock: Arc<Mutex<()>>,
     pub last_active_model: Arc<Mutex<String>>,
+    pub pipeline: Arc<pipeline::RequestPipeline>,
 }
 
 #[tokio::main]
@@ -59,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client,
         swap_lock: Arc::new(Mutex::new(())),
         last_active_model: Arc::new(Mutex::new("main".to_string())),
+        pipeline: Arc::new(pipeline::RequestPipeline::build_default()),
     };
 
     // 3. 서버 시작 시 Main 모델 자동 기동
@@ -438,13 +440,13 @@ async fn handle_main_proxy(
         }
     }
 
-    // 2. 바디 JSON 페이로드 가공 (Hermes 파라미터 & Thinking)
+    // 2. 바디 JSON 페이로드 가공 (A -> B -> C 순차 Inbound 파이프라인)
     let path = uri.path();
     let mut payload = None;
     if !body.is_empty() {
         if let Ok(mut json_val) = serde_json::from_slice::<Value>(&body) {
             let model_path_str = state.config.model_main_path.to_string_lossy().to_string();
-            payload::process_chat_payload(&mut json_val, &model_path_str);
+            state.pipeline.execute(&model_path_str, &mut json_val);
             payload = Some(json_val);
         }
     }
@@ -498,7 +500,7 @@ async fn handle_compact_proxy(
     if !body.is_empty() {
         if let Ok(mut json_val) = serde_json::from_slice::<Value>(&body) {
             let model_path_str = state.config.model_compact_path.to_string_lossy().to_string();
-            payload::process_chat_payload(&mut json_val, &model_path_str);
+            state.pipeline.execute(&model_path_str, &mut json_val);
             payload = Some(json_val);
         }
     }
@@ -530,6 +532,7 @@ mod http_tests {
             http_client: Client::new(),
             swap_lock: Arc::new(Mutex::new(())),
             last_active_model: Arc::new(Mutex::new("main".to_string())),
+            pipeline: Arc::new(pipeline::RequestPipeline::build_default()),
         }
     }
 
