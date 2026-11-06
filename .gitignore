@@ -12,6 +12,15 @@ __pycache__/
 venv/
 ENV/
 
+# Rust
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Web / Node
+**/node_modules/
+**/dist/
+
 # Logs
 *.log
 *.error.log

@@ -17,8 +17,9 @@ from fastapi.responses import StreamingResponse, Response
 PYTHON_BIN = os.environ.get("PYTHON_BIN", os.path.expanduser("~/.mlx-server/bin/python"))
 
 # Model Paths
-MODEL_MAIN_PATH = os.environ.get("MODEL_MAIN_PATH", os.path.expanduser("~/.mlx-models/Qwen3.6-35B-A3B-4bit"))
-MODEL_COMPACT_PATH = os.environ.get("MODEL_COMPACT_PATH", os.path.expanduser("~/.mlx-models/Qwen2.5-7B-Instruct-4bit"))
+MODEL_MAIN_PATH = os.environ.get("MODEL_MAIN_PATH", os.path.expanduser("~/.mlx-models/Qwen3.8-27B-4bit"))
+MODEL_MTP_PATH = os.environ.get("MODEL_MTP_PATH", os.path.expanduser("~/.mlx-models/Qwen3.8-27B-MTP-4bit"))
+MODEL_COMPACT_PATH = os.environ.get("MODEL_COMPACT_PATH", os.path.expanduser("~/.mlx-models/gemma-4-26b-a4b-it-4bit"))
 
 # Internal Ports
 PORT_MAIN_INTERNAL = int(os.environ.get("PORT_MAIN_INTERNAL", 18234))
@@ -60,7 +61,7 @@ LOG_FILE_COMFY_OUT = os.path.join(LOG_DIR, "comfyui.log")
 LOG_FILE_COMFY_ERR = os.path.join(LOG_DIR, "comfyui.error.log")
 
 PROMPT_CACHE_BYTES = os.environ.get("PROMPT_CACHE_BYTES", "4GB")
-PREFILL_STEP_SIZE = os.environ.get("PREFILL_STEP_SIZE", "512")
+PREFILL_STEP_SIZE = os.environ.get("PREFILL_STEP_SIZE", "1024")
 
 STRUCTURED_COMPACTION_CONSTRAINTS = (
     "\n\n========================================\n"
@@ -178,19 +179,17 @@ async def _start_main_unlocked():
     wait_for_port_release(PORT_MAIN_INTERNAL)
     await asyncio.sleep(0.3)
 
-    print(f"[MLX Manager] Starting Main Model ({os.path.basename(MODEL_MAIN_PATH)}) on port {PORT_MAIN_INTERNAL}...", flush=True)
+    print(f"[MLX Manager] Starting Main Model ({os.path.basename(MODEL_MAIN_PATH)}) with mlx-vlm on port {PORT_MAIN_INTERNAL}...", flush=True)
     cmd = [
-        PYTHON_BIN, "-m", "mlx_lm.server",
+        PYTHON_BIN, "-m", "mlx_vlm.server",
         "--model", MODEL_MAIN_PATH,
         "--port", str(PORT_MAIN_INTERNAL),
         "--host", "127.0.0.1",
         "--prefill-step-size", PREFILL_STEP_SIZE,
-        "--max-tokens", "12288",
-        "--prompt-cache-size", "1",
-        "--prompt-cache-bytes", PROMPT_CACHE_BYTES,
-        "--decode-concurrency", "1",
-        "--prompt-concurrency", "1"
+        "--max-tokens", "12288"
     ]
+    if os.path.exists(MODEL_MTP_PATH):
+        cmd.extend(["--draft-model", MODEL_MTP_PATH])
     os.makedirs(LOG_DIR, exist_ok=True)
     f_out = open(LOG_FILE_MAIN_OUT, "a")
     f_err = open(LOG_FILE_MAIN_ERR, "a")
@@ -584,28 +583,63 @@ async def generic_proxy(request: Request, path: str, internal_port: int, timeout
         if target_model and "model" in _data and _data["model"] != target_model:
             _data["model"] = target_model
 
-        # Dynamically forward Hermes / client reasoning & chat_template_kwargs to mlx_lm
+        # Dynamically extract and forward Hermes / client reasoning & chat_template_kwargs to mlx_lm
         chat_template_kwargs = _data.get("chat_template_kwargs") or {}
+        extra_body = _data.get("extra_body") if isinstance(_data.get("extra_body"), dict) else {}
+        if not chat_template_kwargs and isinstance(extra_body.get("chat_template_kwargs"), dict):
+            chat_template_kwargs = dict(extra_body["chat_template_kwargs"])
 
-        if "enable_thinking" not in chat_template_kwargs:
-            reasoning_effort = _data.get("reasoning_effort")
-            if not reasoning_effort and isinstance(_data.get("reasoning"), dict):
-                reasoning_effort = _data["reasoning"].get("effort")
+        # 1. Resolve raw reasoning effort from all possible Hermes / OpenAI payload locations
+        raw_effort = _data.get("reasoning_effort")
+        if not raw_effort and isinstance(_data.get("reasoning"), dict):
+            raw_effort = _data["reasoning"].get("effort")
+        if not raw_effort and "reasoning_effort" in extra_body:
+            raw_effort = extra_body.get("reasoning_effort")
+        if not raw_effort and isinstance(extra_body.get("reasoning"), dict):
+            raw_effort = extra_body["reasoning"].get("effort")
+        if not raw_effort and "reasoning_effort" in chat_template_kwargs:
+            raw_effort = chat_template_kwargs.get("reasoning_effort")
 
-            thinking_opt = _data.get("thinking")
-            if isinstance(thinking_opt, dict) and thinking_opt.get("type") == "disabled":
-                reasoning_effort = "none"
+        # 2. Check thinking disable toggles
+        thinking_opt = _data.get("thinking") or extra_body.get("thinking")
+        if isinstance(thinking_opt, dict) and thinking_opt.get("type") == "disabled":
+            raw_effort = "none"
 
-            if reasoning_effort in ("none", "off", "disabled"):
-                chat_template_kwargs["enable_thinking"] = False
-                print(f"[MLX Proxy] 🧠 Thinking OFF (from Hermes reasoning_effort={reasoning_effort})", flush=True)
-            elif reasoning_effort in ("low", "minimal", "medium", "high"):
-                chat_template_kwargs["enable_thinking"] = True
-                print(f"[MLX Proxy] 🧠 Thinking ON (from Hermes reasoning_effort={reasoning_effort})", flush=True)
-            else:
-                chat_template_kwargs["enable_thinking"] = False
+        # Explicit enable_thinking toggle if already present
+        enable_thinking_override = chat_template_kwargs.get("enable_thinking")
+
+        # 3. Map Hermes effort levels to Qwen / standard Jinja template supported types ('low', 'medium', 'xhigh')
+        EFFORT_MAP = {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "medium",       # 체감 지연 방지: high도 쾌적한 medium으로 집중
+            "extended": "medium",
+            "xhigh": "xhigh",       # 명시적 극단적 추론 시에만 xhigh 허용
+            "max": "xhigh",
+            "ultra": "xhigh",
+        }
+
+        effort_str = str(raw_effort).strip().lower() if raw_effort is not None else ""
+        if effort_str in ("none", "off", "disabled", "false") or enable_thinking_override is False:
+            chat_template_kwargs["enable_thinking"] = False
+            chat_template_kwargs.pop("reasoning_effort", None)
+            _data.pop("reasoning_effort", None)
+            if isinstance(_data.get("extra_body"), dict):
+                _data["extra_body"].pop("reasoning_effort", None)
+            print(f"[MLX Proxy] 🧠 Thinking OFF (from Hermes reasoning_effort='{raw_effort}')", flush=True)
+        elif effort_str in EFFORT_MAP or enable_thinking_override is True:
+            chat_template_kwargs["enable_thinking"] = True
+            resolved_template_effort = EFFORT_MAP.get(effort_str, "medium")
+            chat_template_kwargs["reasoning_effort"] = resolved_template_effort
+            _data["reasoning_effort"] = resolved_template_effort
+            print(f"[MLX Proxy] 🧠 Thinking BALANCED (Hermes effort '{raw_effort}' -> normalized reasoning_effort='{resolved_template_effort}')", flush=True)
         else:
-            print(f"[MLX Proxy] 🧠 Thinking from Hermes extra_body chat_template_kwargs: {chat_template_kwargs.get('enable_thinking')}", flush=True)
+            # Default fallback when unspecified: Thinking ON (Balanced medium)
+            chat_template_kwargs["enable_thinking"] = True
+            chat_template_kwargs["reasoning_effort"] = "medium"
+            _data["reasoning_effort"] = "medium"
+            print(f"[MLX Proxy] 🧠 Thinking BALANCED (Default fallback -> normalized reasoning_effort='medium')", flush=True)
 
         # Robust context compaction / summarization detection
         if not _data.get("tools"):
@@ -628,6 +662,8 @@ async def generic_proxy(request: Request, path: str, internal_port: int, timeout
 
         if is_compaction:
             chat_template_kwargs["enable_thinking"] = False
+            chat_template_kwargs.pop("reasoning_effort", None)
+            _data.pop("reasoning_effort", None)
             print("[MLX Proxy] 🗜️ Context compaction detected -> Force thinking OFF & inject structured anti-bloat constraints", flush=True)
             messages = _data.get("messages", [])
             target_msg = None
@@ -913,7 +949,10 @@ async def proxy_main(request: Request, path: str):
     global last_active_model
     if request.method == "GET" and path in ("health", "status"):
         return get_system_status()
+    if request.method == "GET" and path in ("props", "v1/props"):
+        return {"default_generation_settings": {"n_ctx": 65536}}
     if request.method == "GET" and path in ("v1/models", "models"):
+        ctx_len = 65536
         return {
             "object": "list",
             "data": [
@@ -921,13 +960,12 @@ async def proxy_main(request: Request, path: str):
                     "id": MODEL_MAIN_PATH,
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "mlx_main"
-                },
-                {
-                    "id": os.path.basename(MODEL_MAIN_PATH),
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "mlx_main"
+                    "owned_by": "mlx_main",
+                    "context_length": ctx_len,
+                    "max_context_length": ctx_len,
+                    "max_model_len": ctx_len,
+                    "context_window": ctx_len,
+                    "max_tokens": 32768
                 }
             ]
         }
@@ -948,32 +986,34 @@ async def proxy_compact(request: Request, path: str):
     global last_active_model
     if request.method == "GET" and path in ("health", "status"):
         return get_system_status()
+    if request.method == "GET" and path in ("props", "v1/props"):
+        return {"default_generation_settings": {"n_ctx": 65536}}
     if request.method == "GET" and path in ("v1/models", "models"):
+        compact_ctx = 65536
         return {
             "object": "list",
             "data": [
                 {
-                    "id": MODEL_MAIN_PATH,
+                    "id": MODEL_COMPACT_PATH,
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "mlx_main"
-                },
-                {
-                    "id": os.path.basename(MODEL_MAIN_PATH),
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "mlx_main"
+                    "owned_by": "mlx_compact",
+                    "context_length": compact_ctx,
+                    "max_context_length": compact_ctx,
+                    "max_model_len": compact_ctx,
+                    "context_window": compact_ctx,
+                    "max_tokens": 8192
                 }
             ]
         }
 
-    # Method 2: Route compaction to Main Qwen3.6-35B-A3B directly (Zero swap overhead & 35B intelligence)
+    # On-demand Swapper: Stop Main -> Start Compact (Gemma 4 26B A4B)
     async with swap_lock:
-        last_active_model = "main"
-        await _stop_compact_unlocked()
-        await _start_main_unlocked()
+        last_active_model = "compact"
+        await _stop_main_unlocked()
+        await _start_compact_unlocked()
 
-    return await generic_proxy(request, path, PORT_MAIN_INTERNAL)
+    return await generic_proxy(request, path, PORT_COMPACT_INTERNAL)
 
 
 async def main():
