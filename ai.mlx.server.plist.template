@@ -6,9 +6,13 @@
     <string>ai.mlx.server</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{{HOME}}/.mlx-server/bin/python</string>
-        <string>{{HOME}}/.mlx-server/mlx_manager.py</string>
+        <string>{{HOME}}/.mlx-server/bin/mlx-swapper</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PREFILL_STEP_SIZE</key>
+        <string>1024</string>
+    </dict>
     <key>WorkingDirectory</key>
     <string>{{HOME}}/.mlx-server</string>
     <key>RunAtLoad</key>

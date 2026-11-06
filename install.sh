@@ -12,9 +12,12 @@ echo "=== MLX Dynamic Model Swapper Installer ==="
 mkdir -p "$TARGET_DIR"
 mkdir -p "$HOME/.local/bin"
 
-# 2. Symlink mlx_manager.py
-echo "[1/4] Linking mlx_manager.py to $TARGET_DIR/mlx_manager.py..."
-ln -sf "$SCRIPT_DIR/mlx_manager.py" "$TARGET_DIR/mlx_manager.py"
+# 2. Build and install Rust native swapper
+echo "[1/4] Building rust-swapper in release mode..."
+mkdir -p "$TARGET_DIR/bin"
+(cd "$SCRIPT_DIR/rust-swapper" && cargo build --release)
+cp "$SCRIPT_DIR/rust-swapper/target/release/mlx-swapper" "$TARGET_DIR/bin/mlx-swapper"
+chmod +x "$TARGET_DIR/bin/mlx-swapper"
 
 # 3. Install CLI tool
 echo "[2/4] Installing mlx CLI to $HOME/.local/bin/mlx..."
