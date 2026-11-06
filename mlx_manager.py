@@ -17,8 +17,9 @@ from fastapi.responses import StreamingResponse, Response
 PYTHON_BIN = os.environ.get("PYTHON_BIN", os.path.expanduser("~/.mlx-server/bin/python"))
 
 # Model Paths
-MODEL_MAIN_PATH = os.environ.get("MODEL_MAIN_PATH", os.path.expanduser("~/.mlx-models/Qwen3.6-35B-A3B-4bit"))
-MODEL_COMPACT_PATH = os.environ.get("MODEL_COMPACT_PATH", os.path.expanduser("~/.mlx-models/Qwen2.5-7B-Instruct-4bit"))
+MODEL_MAIN_PATH = os.environ.get("MODEL_MAIN_PATH", os.path.expanduser("~/.mlx-models/Qwen3.8-27B-4bit"))
+MODEL_MTP_PATH = os.environ.get("MODEL_MTP_PATH", os.path.expanduser("~/.mlx-models/Qwen3.8-27B-MTP-4bit"))
+MODEL_COMPACT_PATH = os.environ.get("MODEL_COMPACT_PATH", os.path.expanduser("~/.mlx-models/gemma-4-26b-a4b-it-4bit"))
 
 # Internal Ports
 PORT_MAIN_INTERNAL = int(os.environ.get("PORT_MAIN_INTERNAL", 18234))
@@ -60,7 +61,25 @@ LOG_FILE_COMFY_OUT = os.path.join(LOG_DIR, "comfyui.log")
 LOG_FILE_COMFY_ERR = os.path.join(LOG_DIR, "comfyui.error.log")
 
 PROMPT_CACHE_BYTES = os.environ.get("PROMPT_CACHE_BYTES", "4GB")
-PREFILL_STEP_SIZE = os.environ.get("PREFILL_STEP_SIZE", "512")
+PREFILL_STEP_SIZE = os.environ.get("PREFILL_STEP_SIZE", "1024")
+
+STRUCTURED_COMPACTION_CONSTRAINTS = (
+    "\n\n========================================\n"
+    "[CRITICAL ARCHITECTURAL CONSTRAINTS FOR COMPACTION — HIGHEST PRIORITY]\n"
+    "1. ABSOLUTELY FORBIDDEN: Do NOT output turn-by-turn logs or long numbered action lists (e.g. '1. READ...', '2. PATCH...', 'Turn 1...', 'Turn 80...').\n"
+    "2. MANDATORY COLLAPSE OF HISTORICAL ACTIONS: If the previous summary contains a long list of numbered actions (e.g. 1..80), DO NOT PRESERVE OR REPRODUCE THEM. You MUST collapse all historical actions into at most 3-5 concise bullet points.\n"
+    "3. MANDATORY 4-SECTION SYNTHESIS: Distill the active conversation state directly into these 4 concise sections:\n"
+    "   ## 1. Core Goal & User Intent\n"
+    "   - Primary objectives, user preferences, and scope of work.\n"
+    "   ## 2. Current Architecture & Code State\n"
+    "   - Concrete list of modified files, created files, active services, config parameters, and environment state. (Include exact paths).\n"
+    "   ## 3. Discovered Facts & Issues\n"
+    "   - Root causes identified, bugs resolved, and any active blockers or errors still requiring resolution.\n"
+    "   ## 4. Next Immediate Steps\n"
+    "   - Prioritized bullet points of the exact next actions to take.\n"
+    "4. STRICT TOKEN BUDGET: Total output MUST be under 500 words (~600 tokens). High density, zero fluff, zero timeline duplication.\n"
+    "========================================\n"
+)
 
 process_main = None
 process_compact = None
@@ -160,19 +179,17 @@ async def _start_main_unlocked():
     wait_for_port_release(PORT_MAIN_INTERNAL)
     await asyncio.sleep(0.3)
 
-    print(f"[MLX Manager] Starting Main Model ({os.path.basename(MODEL_MAIN_PATH)}) on port {PORT_MAIN_INTERNAL}...", flush=True)
+    print(f"[MLX Manager] Starting Main Model ({os.path.basename(MODEL_MAIN_PATH)}) with mlx-vlm on port {PORT_MAIN_INTERNAL}...", flush=True)
     cmd = [
-        PYTHON_BIN, "-m", "mlx_lm.server",
+        PYTHON_BIN, "-m", "mlx_vlm.server",
         "--model", MODEL_MAIN_PATH,
         "--port", str(PORT_MAIN_INTERNAL),
         "--host", "127.0.0.1",
         "--prefill-step-size", PREFILL_STEP_SIZE,
-        "--max-tokens", "12288",
-        "--prompt-cache-size", "1",
-        "--prompt-cache-bytes", PROMPT_CACHE_BYTES,
-        "--decode-concurrency", "1",
-        "--prompt-concurrency", "1"
+        "--max-tokens", "12288"
     ]
+    if os.path.exists(MODEL_MTP_PATH):
+        cmd.extend(["--draft-model", MODEL_MTP_PATH])
     os.makedirs(LOG_DIR, exist_ok=True)
     f_out = open(LOG_FILE_MAIN_OUT, "a")
     f_err = open(LOG_FILE_MAIN_ERR, "a")
@@ -559,43 +576,132 @@ async def generic_proxy(request: Request, path: str, internal_port: int, timeout
     body = await request.body()
     has_tools = False
     is_streaming = True
+    is_compaction = False
     try:
         _data = json.loads(body)
         target_model = PORT_TO_MODEL.get(internal_port)
         if target_model and "model" in _data and _data["model"] != target_model:
             _data["model"] = target_model
 
-        # Dynamically forward Hermes / client reasoning & chat_template_kwargs to mlx_lm
+        # Dynamically extract and forward Hermes / client reasoning & chat_template_kwargs to mlx_lm
         chat_template_kwargs = _data.get("chat_template_kwargs") or {}
+        extra_body = _data.get("extra_body") if isinstance(_data.get("extra_body"), dict) else {}
+        if not chat_template_kwargs and isinstance(extra_body.get("chat_template_kwargs"), dict):
+            chat_template_kwargs = dict(extra_body["chat_template_kwargs"])
 
-        if "enable_thinking" not in chat_template_kwargs:
-            reasoning_effort = _data.get("reasoning_effort")
-            if not reasoning_effort and isinstance(_data.get("reasoning"), dict):
-                reasoning_effort = _data["reasoning"].get("effort")
+        # 1. Resolve raw reasoning effort from all possible Hermes / OpenAI payload locations
+        raw_effort = _data.get("reasoning_effort")
+        if not raw_effort and isinstance(_data.get("reasoning"), dict):
+            raw_effort = _data["reasoning"].get("effort")
+        if not raw_effort and "reasoning_effort" in extra_body:
+            raw_effort = extra_body.get("reasoning_effort")
+        if not raw_effort and isinstance(extra_body.get("reasoning"), dict):
+            raw_effort = extra_body["reasoning"].get("effort")
+        if not raw_effort and "reasoning_effort" in chat_template_kwargs:
+            raw_effort = chat_template_kwargs.get("reasoning_effort")
 
-            thinking_opt = _data.get("thinking")
-            if isinstance(thinking_opt, dict) and thinking_opt.get("type") == "disabled":
-                reasoning_effort = "none"
+        # 2. Check thinking disable toggles
+        thinking_opt = _data.get("thinking") or extra_body.get("thinking")
+        if isinstance(thinking_opt, dict) and thinking_opt.get("type") == "disabled":
+            raw_effort = "none"
 
-            if reasoning_effort in ("none", "off", "disabled"):
-                chat_template_kwargs["enable_thinking"] = False
-                print(f"[MLX Proxy] 🧠 Thinking OFF (from Hermes reasoning_effort={reasoning_effort})", flush=True)
-            elif reasoning_effort in ("low", "minimal", "medium", "high"):
-                chat_template_kwargs["enable_thinking"] = True
-                print(f"[MLX Proxy] 🧠 Thinking ON (from Hermes reasoning_effort={reasoning_effort})", flush=True)
-            else:
-                chat_template_kwargs["enable_thinking"] = False
+        # Explicit enable_thinking toggle if already present
+        enable_thinking_override = chat_template_kwargs.get("enable_thinking")
+
+        # 3. Map Hermes effort levels to Qwen / standard Jinja template supported types ('low', 'medium', 'xhigh')
+        EFFORT_MAP = {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "medium",       # 체감 지연 방지: high도 쾌적한 medium으로 집중
+            "extended": "medium",
+            "xhigh": "xhigh",       # 명시적 극단적 추론 시에만 xhigh 허용
+            "max": "xhigh",
+            "ultra": "xhigh",
+        }
+
+        effort_str = str(raw_effort).strip().lower() if raw_effort is not None else ""
+        if effort_str in ("none", "off", "disabled", "false") or enable_thinking_override is False:
+            chat_template_kwargs["enable_thinking"] = False
+            chat_template_kwargs.pop("reasoning_effort", None)
+            _data.pop("reasoning_effort", None)
+            if isinstance(_data.get("extra_body"), dict):
+                _data["extra_body"].pop("reasoning_effort", None)
+            print(f"[MLX Proxy] 🧠 Thinking OFF (from Hermes reasoning_effort='{raw_effort}')", flush=True)
+        elif effort_str in EFFORT_MAP or enable_thinking_override is True:
+            chat_template_kwargs["enable_thinking"] = True
+            resolved_template_effort = EFFORT_MAP.get(effort_str, "medium")
+            chat_template_kwargs["reasoning_effort"] = resolved_template_effort
+            _data["reasoning_effort"] = resolved_template_effort
+            print(f"[MLX Proxy] 🧠 Thinking BALANCED (Hermes effort '{raw_effort}' -> normalized reasoning_effort='{resolved_template_effort}')", flush=True)
         else:
-            print(f"[MLX Proxy] 🧠 Thinking from Hermes extra_body chat_template_kwargs: {chat_template_kwargs.get('enable_thinking')}", flush=True)
+            # Default fallback when unspecified: Thinking ON (Balanced medium)
+            chat_template_kwargs["enable_thinking"] = True
+            chat_template_kwargs["reasoning_effort"] = "medium"
+            _data["reasoning_effort"] = "medium"
+            print(f"[MLX Proxy] 🧠 Thinking BALANCED (Default fallback -> normalized reasoning_effort='medium')", flush=True)
 
-        # Ensure thinking is ALWAYS forced OFF for compression / summarization requests
+        # Robust context compaction / summarization detection
         if not _data.get("tools"):
-            first_msg_content = ""
-            if _data.get("messages") and len(_data["messages"]) > 0:
-                first_msg_content = str(_data["messages"][0].get("content", "")).lower()
-            if any(k in first_msg_content for k in ("summar", "compact", "recap", "conversation history")):
-                chat_template_kwargs["enable_thinking"] = False
-                print("[MLX Proxy] 🗜️ Compression/summary task detected -> Force thinking OFF!", flush=True)
+            messages = _data.get("messages", [])
+            for m in messages:
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    c_lower = content.lower()
+                    if (
+                        "summarization agent creating a context checkpoint" in c_lower
+                        or "context compaction" in c_lower
+                        or "turns to summarize" in c_lower
+                        or "update a context compaction summary" in c_lower
+                        or "create a structured checkpoint summary" in c_lower
+                        or "earlier turns are compacted" in c_lower
+                        or "summarize the conversation" in c_lower
+                    ):
+                        is_compaction = True
+                        break
+
+        if is_compaction:
+            chat_template_kwargs["enable_thinking"] = False
+            chat_template_kwargs.pop("reasoning_effort", None)
+            _data.pop("reasoning_effort", None)
+            print("[MLX Proxy] 🗜️ Context compaction detected -> Force thinking OFF & inject structured anti-bloat constraints", flush=True)
+            messages = _data.get("messages", [])
+            target_msg = None
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    target_msg = m
+                    break
+            if not target_msg and messages:
+                target_msg = messages[-1]
+
+            if target_msg and isinstance(target_msg.get("content"), str):
+                c = target_msg["content"]
+                # 1. Neutralize Hermes prompt directive that forces continuing the numbered list
+                if "ADD new completed actions to the numbered list" in c:
+                    c = c.replace(
+                        "ADD new completed actions to the numbered list (continue numbering).",
+                        "CONDENSE all historical actions into at most 3-5 high-level bullet points. NEVER copy or continue long numbered lists!"
+                    )
+
+                # 2. Collapse bloated historical action lists inside PREVIOUS SUMMARY to stop prompt explosion
+                def collapse_completed_actions(match):
+                    header = match.group(1)
+                    actions = match.group(2).strip().splitlines()
+                    if len(actions) > 5:
+                        collapsed = actions[:2] + [f"... [{len(actions)-4} earlier actions collapsed for brevity] ..."] + actions[-2:]
+                        return header + "\n".join(collapsed) + "\n"
+                    return match.group(0)
+
+                c = re.sub(r"(## Completed Actions\s*\n)(.*?)(?=\n## |\Z)", collapse_completed_actions, c, flags=re.DOTALL)
+
+                # 3. Collapse bloated Detailed Session Log (Turn 1..N) to eliminate 17,000+ chars of bloat
+                c = re.sub(r"(## Detailed Session Log[^\n]*\n)(.*?)(?=\n## |\Z)", r"\1- Historical session turns consolidated into active state for compactness.\n", c, flags=re.DOTALL)
+
+                # 4. Append strict architectural constraints
+                if "[CRITICAL ARCHITECTURAL CONSTRAINTS FOR COMPACTION" not in c:
+                    c += STRUCTURED_COMPACTION_CONSTRAINTS
+
+                target_msg["content"] = c
 
         _data["chat_template_kwargs"] = chat_template_kwargs
 
@@ -716,9 +822,19 @@ async def generic_proxy(request: Request, path: str, internal_port: int, timeout
                     pass
                 return Response(content=content, status_code=resp.status_code, headers=response_headers, media_type=resp.headers.get("content-type"))
 
+        if not is_streaming:
+            content = await resp.aread()
+            await client.aclose()
+            if is_compaction:
+                content = content.replace(b'"finish_reason":"length"', b'"finish_reason":"stop"').replace(b'"finish_reason": "length"', b'"finish_reason": "stop"')
+            return Response(content=content, status_code=resp.status_code, headers=response_headers, media_type=resp.headers.get("content-type"))
+
         async def stream_generator():
             try:
                 async for chunk in resp.aiter_raw():
+                    if is_compaction:
+                        if b'"finish_reason":"length"' in chunk or b'"finish_reason": "length"' in chunk:
+                            chunk = chunk.replace(b'"finish_reason":"length"', b'"finish_reason":"stop"').replace(b'"finish_reason": "length"', b'"finish_reason": "stop"')
                     yield chunk
             finally:
                 await resp.aclose()
@@ -833,7 +949,10 @@ async def proxy_main(request: Request, path: str):
     global last_active_model
     if request.method == "GET" and path in ("health", "status"):
         return get_system_status()
+    if request.method == "GET" and path in ("props", "v1/props"):
+        return {"default_generation_settings": {"n_ctx": 65536}}
     if request.method == "GET" and path in ("v1/models", "models"):
+        ctx_len = 65536
         return {
             "object": "list",
             "data": [
@@ -841,13 +960,12 @@ async def proxy_main(request: Request, path: str):
                     "id": MODEL_MAIN_PATH,
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "mlx_main"
-                },
-                {
-                    "id": os.path.basename(MODEL_MAIN_PATH),
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "mlx_main"
+                    "owned_by": "mlx_main",
+                    "context_length": ctx_len,
+                    "max_context_length": ctx_len,
+                    "max_model_len": ctx_len,
+                    "context_window": ctx_len,
+                    "max_tokens": 32768
                 }
             ]
         }
@@ -865,104 +983,37 @@ app_compact = FastAPI(title="MLX Compaction Proxy")
 
 @app_compact.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_compact(request: Request, path: str):
+    global last_active_model
     if request.method == "GET" and path in ("health", "status"):
         return get_system_status()
-    if request.method != "POST" or "chat/completions" not in path:
-        if path in ("v1/models", "models"):
-            return {
-                "object": "list",
-                "data": [
-                    {
-                        "id": MODEL_COMPACT_PATH,
-                        "object": "model",
-                        "created": int(time.time()),
-                        "owned_by": "mlx_compaction"
-                    }
-                ]
-            }
-        return Response(content='{"status": "ok"}', status_code=200, media_type="application/json")
+    if request.method == "GET" and path in ("props", "v1/props"):
+        return {"default_generation_settings": {"n_ctx": 65536}}
+    if request.method == "GET" and path in ("v1/models", "models"):
+        compact_ctx = 65536
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": MODEL_COMPACT_PATH,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "mlx_compact",
+                    "context_length": compact_ctx,
+                    "max_context_length": compact_ctx,
+                    "max_model_len": compact_ctx,
+                    "context_window": compact_ctx,
+                    "max_tokens": 8192
+                }
+            ]
+        }
 
-    # For actual compaction (POST chat/completions):
-    # Hold swap_lock across the ENTIRE compaction and restore Main model afterwards
-    await swap_lock.acquire()
-    try:
-        print(f"[MLX Manager] Compaction requested! Stopping Main model and starting Compaction model...", flush=True)
+    # On-demand Swapper: Stop Main -> Start Compact (Gemma 4 26B A4B)
+    async with swap_lock:
+        last_active_model = "compact"
         await _stop_main_unlocked()
         await _start_compact_unlocked()
 
-        url = f"http://127.0.0.1:{PORT_COMPACT_INTERNAL}/{path}"
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("content-length", None)
-
-        body = await request.body()
-        try:
-            payload = json.loads(body)
-            messages = payload.get("messages", [])
-            if messages and isinstance(messages, list):
-                last_msg = messages[-1]
-                if isinstance(last_msg, dict) and last_msg.get("role") == "user":
-                    content = last_msg.get("content", "")
-                    if isinstance(content, str) and "CRITICAL CONSTRAINTS FOR COMPACTNESS" not in content:
-                        last_msg["content"] = content + (
-                            "\n\nCRITICAL CONSTRAINTS FOR COMPACTNESS:\n"
-                            "- Keep the entire summary strictly under 1,500 tokens.\n"
-                            "- Summarize actions concisely as brief 1-line bullet points without pasting code blocks, diffs, or raw terminal dumps.\n"
-                            "- Group similar repetitive tool actions together.\n"
-                            "- Conclude immediately with ## Active State and your next steps.\n"
-                        )
-                        body = json.dumps(payload).encode("utf-8")
-        except Exception as ex:
-            print(f"[MLX Manager] Notice: could not inject compactness constraint: {ex}", flush=True)
-
-        client = httpx.AsyncClient(timeout=600.0)
-
-        req = client.build_request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            content=body,
-            params=request.query_params
-        )
-        resp = await client.send(req, stream=True)
-
-        async def stream_and_restore():
-            try:
-                async for chunk in resp.aiter_raw():
-                    # Safety guarantee: ensure Hermes never aborts on length finish_reason
-                    if b'"finish_reason":"length"' in chunk or b'"finish_reason": "length"' in chunk:
-                        chunk = chunk.replace(b'"finish_reason":"length"', b'"finish_reason":"stop"').replace(b'"finish_reason": "length"', b'"finish_reason": "stop"')
-                    yield chunk
-            finally:
-                try:
-                    await resp.aclose()
-                    await client.aclose()
-                    print(f"[MLX Manager] Compaction stream complete! Restoring Main model (Qwen3.6)...", flush=True)
-                    await _stop_compact_unlocked()
-                    await _start_main_unlocked()
-                    print(f"[MLX Manager] Main model restored successfully!", flush=True)
-                finally:
-                    swap_lock.release()
-                    print("[MLX Manager] Swap lock released.", flush=True)
-
-        response_headers = dict(resp.headers)
-        response_headers.pop("content-length", None)
-        response_headers.pop("content-encoding", None)
-
-        return StreamingResponse(
-            stream_and_restore(),
-            status_code=resp.status_code,
-            headers=response_headers,
-            media_type=resp.headers.get("content-type")
-        )
-    except Exception as e:
-        print(f"[MLX Manager] Compaction error: {e}", flush=True)
-        try:
-            await _stop_compact_unlocked()
-            await _start_main_unlocked()
-        finally:
-            swap_lock.release()
-        return Response(content=f'{{"error": "{str(e)}"}}', status_code=502, media_type="application/json")
+    return await generic_proxy(request, path, PORT_COMPACT_INTERNAL)
 
 
 async def main():

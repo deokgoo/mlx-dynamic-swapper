@@ -1,0 +1,33 @@
+[package]
+name = "mlx-swapper"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance zero-overhead dynamic model swapper for Apple Silicon & Hermes"
+
+[dependencies]
+# 비동기 런타임 (Python의 asyncio 역할)
+tokio = { version = "1.38", features = ["full"] }
+
+# 고성능 웹 프레임워크 (Python의 FastAPI 역할)
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+
+# 비동기 HTTP 클라이언트 (Python의 httpx.AsyncClient 역할)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# JSON 직렬화/역직렬화 (Python의 json / dict 역할)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 비동기 스트림 처리 (SSE 중계용)
+futures-util = "0.3"
+tokio-stream = "0.1"
+http-body-util = "0.1"
+
+# POSIX 프로세스 시그널 및 프로세스 그룹 제어 (Python의 os.killpg 역할)
+nix = { version = "0.29", features = ["signal", "process"] }
+
+# 로깅 및 트레이싱 (Python의 print/logging 역할)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
