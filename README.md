@@ -69,7 +69,7 @@ flowchart LR
 | **2** | **`ThinkingNormalizerFilter`** | Hermes의 `reasoning_effort`를 MLX/Qwen 템플릿 표준(`enable_thinking`, `xhigh`/`medium`)으로 정규화 |
 | **3** | **`CompactionInterceptorFilter`** | 컨텍스트 요약 요청 감지 시 Thinking을 끄고 4섹션 고밀도 압축 제약조건 주입 |
 | **4** | **`UniversalToolGuardFilter`** | 도구 스키마 대조를 통한 단/복수형 파라미터 자동 교정 및 이중 문자열화 JSON 언패킹 |
-| **5** | **`AntiLoopGuardFilter`** | 직전 도구 실패 감지 시 `[ANTI-LOOP GUARD]` 런타임 가이드를 동적 주입하여 반복 루프 차단 |
+| **5** | **`AntiLoopGuardFilter`** | 직전 도구 실패 차단 및 동일 도구·인자 반복 호출 멱등 루프(`DUPLICATE TOOL-CALL`) 감지 시 즉시 답변 작성 강제 |
 
 > 💡 **새로운 레이어 추가 방법 (OCP 준수)**:  
 > `src/pipeline/` 아래에 `PayloadFilter` 트레이트를 구현한 구조체를 만들고, `RequestPipeline::build_default()`에 `Box::new(MyNewFilter)`를 등록하기만 하면 기존 코드를 일절 건드리지 않고 새로운 방어/가공 레이어를 무한히 확장할 수 있습니다.
@@ -82,8 +82,9 @@ flowchart LR
    - 도구 스키마를 동적으로 분석하여, 필수 인자가 단수(`query`, `path`, `command`)인데 모델이 복수(`queries`, `paths`, `commands`, `_list`)로 넘긴 경우, 스키마에 맞게 올바른 단수형 키로 자동 변환하고 첫 번째 유효 인자를 언랩합니다.
 2. **이중 문자열화 JSON 자동 언패킹 (Stringified JSON Unwrapper)**:
    - 모델이 인자 내부에 따옴표로 감싼 JSON 문자열(`"\"['item1', 'item2']\""`)을 넘기더라도 껍질을 벗겨 정상적인 JSON 구조로 복구합니다.
-3. **동적 안티-루프 가이드 주입 (Dynamic Anti-Loop Injector)**:
-   - 직전 도구 실행에서 에러가 발생한 경우, 다음 턴의 프롬프트에 `[CRITICAL RUNTIME GUIDANCE — ANTI-LOOP GUARD]`를 동적으로 주입하여 모델이 동일한 실패 인자를 앵무새처럼 복제하는 자가 증식 루프를 100% 방지합니다.
+3. **동적 안티-루프 및 중복 호출 가드 (Dynamic Anti-Loop & Duplicate-Call Guard)**:
+   - **중복 호출 루프 방지**: 도구가 성공했음에도 불구하고 모델이 동일한 도구와 동일한 인자를 연속 호출하는 멱등 루프(`DUPLICATE TOOL-CALL`)를 감지하면, 다음 턴에 `[CRITICAL RUNTIME GUIDANCE — DUPLICATE TOOL-CALL DETECTED]`를 주입하여 중복 도구 호출을 금지하고 상단 결과를 바탕으로 즉시 최종 답변을 작성하도록 강제합니다.
+   - **실패 반복 복제 차단**: 직전 도구 실행에서 에러가 발생한 경우, 다음 턴의 프롬프트에 `[CRITICAL RUNTIME GUIDANCE — ANTI-LOOP GUARD]`를 동적으로 주입하여 모델이 동일한 실패 인자를 앵무새처럼 복제하는 자가 증식 루프를 100% 방지합니다.
 
 ---
 
