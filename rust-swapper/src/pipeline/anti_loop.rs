@@ -3,7 +3,8 @@ use serde_json::{json, Value};
 use tracing::info;
 
 /// 5단계: [Anti-Loop Guard]
-/// 1) 도구가 성공했음에도 동일한 도구와 인자를 연속 호출하는 멱등 루프(Duplicate Tool-Call Loop) 감지 및 즉시 답변 강제
+/// 1) 도구가 성공했음에도 동일한 도구와 인자를 연속 호출하는 멱등 루프(Duplicate Tool-Call Loop) 감지 시
+///    System 프롬프트에 지능적 긴급 가이드를 주입하여 중복 호출을 차단하고 최종 답변 작성을 유도
 /// 2) 직전 도구 실패 시 동일 실패 앵무새 복제를 차단하는 동적 가이드 주입
 pub struct AntiLoopGuardFilter;
 
@@ -39,7 +40,7 @@ impl PayloadFilter for AntiLoopGuardFilter {
                         if let Some(func) = call.get("function") {
                             let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                             let raw_args = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
-                            // JSON 정규화 (공백/키 순서 무시 비교를 위함)
+                            // JSON 정규화 (공백/키 순서 무시 비교)
                             let normalized_args = match serde_json::from_str::<Value>(raw_args) {
                                 Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| raw_args.trim().to_string()),
                                 Err(_) => raw_args.trim().to_string(),
@@ -61,7 +62,7 @@ impl PayloadFilter for AntiLoopGuardFilter {
 
         let mut duplicate_tool_detected = None;
 
-        // 패턴 A: 가장 최근 assistant 턴의 호출 중 하나가 바로 직전(그 이전) assistant 턴의 호출과 완전히 동일한 경우
+        // 패턴 A: 최근 턴과 직전 턴 비교 (연속 호출)
         if assistant_tool_calls.len() >= 2 {
             let latest_calls = &assistant_tool_calls[0];
             let prev_calls = &assistant_tool_calls[1];
@@ -74,7 +75,7 @@ impl PayloadFilter for AntiLoopGuardFilter {
             }
         }
 
-        // 패턴 B: 최근 assistant 턴들 전체에서 동일한 (name, args)가 2회 이상 발견된 경우
+        // 패턴 B: 최근 턴이 과거 히스토리 내의 호출과 일치 (누적 중복)
         if duplicate_tool_detected.is_none() && !assistant_tool_calls.is_empty() {
             if let Some(latest_calls) = assistant_tool_calls.first() {
                 for (name, args) in latest_calls {
@@ -111,36 +112,67 @@ impl PayloadFilter for AntiLoopGuardFilter {
             }
         }
 
-        // 동적 가이드 프롬프트 작성 (중복 호출 감지 우선)
+        // 3. 지능적 런타임 가이드 작성
         let guidance = if let Some(dup_tool) = duplicate_tool_detected {
             Some(format!(
                 "\n\n[CRITICAL RUNTIME GUIDANCE — DUPLICATE TOOL-CALL DETECTED]\n\
-                You have ALREADY called '{}' with the exact same arguments and received valid results above.\n\
-                ⚠️ DO NOT call '{}' with the same arguments again.\n\
-                You MUST now synthesize the information from the results above and deliver your final answer to the user immediately.\n",
-                dup_tool, dup_tool
+                You have ALREADY called '{dup_tool}' with identical arguments and received valid results above.\n\
+                ⚠️ DO NOT repeat '{dup_tool}' with the same parameters.\n\
+                - If the gathered information is sufficient, you MUST now synthesize your final response in Korean and answer the user directly.\n\
+                - If additional research is strictly required, use a completely DIFFERENT tool or a distinctly different search query.\n"
             ))
         } else if let Some((tool_name, error_snippet)) = failed_tool_info {
             Some(format!(
                 "\n\n[CRITICAL RUNTIME GUIDANCE — ANTI-LOOP GUARD]\n\
-                Your previous call to '{}' encountered an error: {}\n\
+                Your previous call to '{tool_name}' encountered an error: {}.\n\
                 ⚠️ DO NOT repeat the exact same tool call or identical arguments.\n\
                 You MUST either correct your parameter names and format, or switch to a different tool/strategy.\n",
-                tool_name, error_snippet.replace('\n', " ")
+                error_snippet.replace('\n', " ")
             ))
         } else {
             None
         };
 
+        // 4. 가이드 주입: System 메시지가 있으면 System 프롬프트에 주입, 없으면 마지막 메시지에 주입
         if let Some(notice) = guidance {
-            // 마지막 메시지의 content 끝에 주입
-            if let Some(last_msg) = messages.last_mut().and_then(|m| m.as_object_mut()) {
-                if let Some(content_val) = last_msg.get_mut("content") {
-                    if let Some(s) = content_val.as_str() {
-                        if !s.contains("[CRITICAL RUNTIME GUIDANCE") {
-                            *content_val = json!(format!("{}{}", s, notice));
-                            info!(target: "pipeline", "🛡️ [AntiLoopGuard] Injected guidance: {}", notice.lines().nth(1).unwrap_or(""));
-                            ctx.record_modified(self.name());
+            let mut injected = false;
+
+            // System 메시지 탐색 및 주입
+            for msg in messages.iter_mut() {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role == "system" {
+                    if let Some(content_val) = msg.get_mut("content") {
+                        if let Some(s) = content_val.as_str() {
+                            if !s.contains("[CRITICAL RUNTIME GUIDANCE") {
+                                *content_val = json!(format!("{}{}", s, notice));
+                                info!(
+                                    target: "pipeline",
+                                    "🛡️ [AntiLoopGuard] Injected system-level guidance: {}",
+                                    notice.lines().nth(1).unwrap_or("")
+                                );
+                                ctx.record_modified(self.name());
+                                injected = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // System 메시지가 없으면 마지막 메시지에 주입
+            if !injected {
+                if let Some(last_msg) = messages.last_mut().and_then(|m| m.as_object_mut()) {
+                    if let Some(content_val) = last_msg.get_mut("content") {
+                        if let Some(s) = content_val.as_str() {
+                            if !s.contains("[CRITICAL RUNTIME GUIDANCE") {
+                                *content_val = json!(format!("{}{}", s, notice));
+                                info!(
+                                    target: "pipeline",
+                                    "🛡️ [AntiLoopGuard] Injected guidance into last message: {}",
+                                    notice.lines().nth(1).unwrap_or("")
+                                );
+                                ctx.record_modified(self.name());
+                            }
                         }
                     }
                 }
@@ -156,12 +188,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_anti_loop_duplicate_call_detection() {
+    fn test_anti_loop_duplicate_call_system_injection() {
         let filter = AntiLoopGuardFilter;
         let mut ctx = PipelineContext::new("qwen");
 
         let mut payload = json!({
             "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
                 {
                     "role": "assistant",
                     "tool_calls": [{
@@ -201,9 +237,9 @@ mod tests {
 
         filter.apply(&mut ctx, &mut payload).unwrap();
 
-        let last_content = payload["messages"][3]["content"].as_str().unwrap();
-        assert!(last_content.contains("[CRITICAL RUNTIME GUIDANCE — DUPLICATE TOOL-CALL DETECTED]"));
-        assert!(last_content.contains("You have ALREADY called 'web_search'"));
+        let sys_content = payload["messages"][0]["content"].as_str().unwrap();
+        assert!(sys_content.contains("[CRITICAL RUNTIME GUIDANCE — DUPLICATE TOOL-CALL DETECTED]"));
+        assert!(sys_content.contains("You have ALREADY called 'web_search'"));
         assert!(ctx.modified_layers.contains(&"AntiLoopGuard"));
     }
 
@@ -215,6 +251,10 @@ mod tests {
         let mut payload = json!({
             "messages": [
                 {
+                    "role": "system",
+                    "content": "Base prompt."
+                },
+                {
                     "role": "tool",
                     "name": "execute_code",
                     "content": "Exception: SyntaxError at line 1"
@@ -224,9 +264,9 @@ mod tests {
 
         filter.apply(&mut ctx, &mut payload).unwrap();
 
-        let last_content = payload["messages"][0]["content"].as_str().unwrap();
-        assert!(last_content.contains("[CRITICAL RUNTIME GUIDANCE — ANTI-LOOP GUARD]"));
-        assert!(last_content.contains("SyntaxError"));
+        let sys_content = payload["messages"][0]["content"].as_str().unwrap();
+        assert!(sys_content.contains("[CRITICAL RUNTIME GUIDANCE — ANTI-LOOP GUARD]"));
+        assert!(sys_content.contains("SyntaxError"));
     }
 
     #[test]
@@ -236,6 +276,10 @@ mod tests {
 
         let mut payload = json!({
             "messages": [
+                {
+                    "role": "system",
+                    "content": "Base prompt."
+                },
                 {
                     "role": "assistant",
                     "tool_calls": [{
@@ -275,8 +319,8 @@ mod tests {
 
         filter.apply(&mut ctx, &mut payload).unwrap();
 
-        let last_content = payload["messages"][3]["content"].as_str().unwrap();
-        assert!(!last_content.contains("[CRITICAL RUNTIME GUIDANCE"));
+        let sys_content = payload["messages"][0]["content"].as_str().unwrap();
+        assert!(!sys_content.contains("[CRITICAL RUNTIME GUIDANCE"));
         assert!(!ctx.modified_layers.contains(&"AntiLoopGuard"));
     }
 }
