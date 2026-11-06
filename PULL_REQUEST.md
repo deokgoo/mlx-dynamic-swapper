@@ -39,9 +39,9 @@
 - **배경**: 긴 에이전트 세션(4만+ 토큰)에서 모델이 도구 파라미터 단/복수형 오타(예: `web_search`의 `query`를 `queries`로 호출)를 내면, 동일한 실패를 앵무새처럼 반복 복제하다 안티-루프 가드에 걸려 멈추는 현상 발생.
 - **스키마 기반 범용 단/복수 매퍼 (`Fuzzy Parameter Resolver`)**: 도구 스키마의 필수 인자(`query`, `path`, `command` 등)와 모델이 보낸 인자(`queries`, `paths`, `_list`)를 비교하여 올바른 단수형으로 자동 매핑하고 첫 번째 요소를 자동 언랩.
 - **이중 문자열화 JSON 자동 언패킹 (`Stringified JSON Unwrapper`)**: `"\"['a', 'b']\""` 형태의 이스케이프 실수를 자동 감지하여 정상 JSON 구조로 정규화.
-- **동적 안티-루프 & 중복 호출 가이드 주입 (`Dynamic Anti-Loop & Duplicate-Call Injector`)**:
-  - 도구가 성공했음에도 동일한 도구와 동일한 인자를 연속 호출하는 멱등 루프(`Duplicate Tool-Call`)를 감지하여 즉시 사용자 답변 작성을 강제하는 가이드 주입.
-  - 직전 도구 실행에서 에러 발생 시, `[CRITICAL RUNTIME GUIDANCE — ANTI-LOOP GUARD]`를 다음 턴 프롬프트에 동적 주입하여 동일 실패 반복을 원천 차단.
+- **동적 안티-루프 & 물리적 도구 압수 가드 (`Dynamic Anti-Loop & Hard-Block Injector`)**:
+  - 도구를 동일한 인자로 연속 재호출하는 루프 감지 시, 프롬프트 경고뿐만 아니라 페이로드에 **`"tool_choice": "none"`을 강제 설정**하여 MLX가 도구 목록을 통째로 압수하도록 함으로써 무한 루프를 100% 원천 차단하고 즉시 사용자 답변 작성을 물리적으로 강제.
+  - 직전 도구 실행에서 에러/블록(`BLOCKED:`) 발생 시, System 프롬프트에 `[CRITICAL RUNTIME GUIDANCE — ANTI-LOOP GUARD]`를 동적 주입하여 동일 실패 반복 차단.
 
 ### 7. Apple M5 Max 프리필(Prefill) 1024 청크 최적화
 - **배경**: 기본 512 청크 단위 분할로 인해 4만 토큰 프리필 시 70회 이상의 스텝 분할로 M5 Max의 대용량 메모리 대역폭을 충분히 활용하지 못해 긴 침묵(40~60초) 발생.
