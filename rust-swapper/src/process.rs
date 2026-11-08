@@ -186,6 +186,20 @@ impl ProcessManager {
         Self::terminate_process(&mut *lock).await;
     }
 
+    /// 🩹 [Self-Heal] Main 모델 재시작 (크래시/다운 시 기존 슬롯 정리 후 새로 기동)
+    pub async fn restart_main(
+        &self,
+        python_bin: &Path,
+        model_path: &Path,
+        mtp_path: &Path,
+        port: u16,
+        prefill_step_size: &str,
+        log_dir: &Path,
+    ) -> Result<(), String> {
+        self.stop_main().await;
+        self.start_main(python_bin, model_path, mtp_path, port, prefill_step_size, log_dir).await
+    }
+
     /// Compact 모델(Gemma 4 26B) 기동
     pub async fn start_compact(
         &self,
@@ -263,6 +277,19 @@ impl ProcessManager {
     pub async fn stop_compact(&self) {
         let mut lock = self.compact_proc.lock().await;
         Self::terminate_process(&mut *lock).await;
+    }
+
+    /// 🩹 [Self-Heal] Compact 모델 재시작 (크래시/다운 시 기존 슬롯 정리 후 새로 기동)
+    pub async fn restart_compact(
+        &self,
+        python_bin: &Path,
+        model_path: &Path,
+        port: u16,
+        prefill_step_size: &str,
+        log_dir: &Path,
+    ) -> Result<(), String> {
+        self.stop_compact().await;
+        self.start_compact(python_bin, model_path, port, prefill_step_size, log_dir).await
     }
 
     /// ComfyUI 백엔드 기동

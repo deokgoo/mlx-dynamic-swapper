@@ -162,6 +162,7 @@ async fn get_process_rss_mb(pid: u32) -> Option<u64> {
     Some(kb / 1024)
 }
 
+/// [System Stats] GPU/RAM 상태 + 모델 포트 상태 + 활성 모델
 async fn system_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut free_pct = 46.0;
     if let Ok(output) = tokio::process::Command::new("memory_pressure").output().await {
@@ -221,6 +222,7 @@ async fn health_check() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
+/// [Status] 상태 조회 (Rust 네이티브 메모리 기반)
 async fn status_check(State(state): State<AppState>) -> impl IntoResponse {
     let main_running = state.process_mgr.is_main_running().await;
     let compact_running = state.process_mgr.is_compact_running().await;
@@ -425,6 +427,7 @@ async fn handle_main_proxy(
         if *active != "main" {
             info!("🔄 Swapping back to Main Model...");
             state.process_mgr.stop_compact().await;
+            state.process_mgr.stop_comfy().await;
             state
                 .process_mgr
                 .start_main(
@@ -452,16 +455,55 @@ async fn handle_main_proxy(
         }
     }
 
-    // 3. 내부 18234 포트로 프록시 전달
-    proxy::forward_request(
+    // 3. 🩹 [EAFP / Retry] 1차 프록시 전달 시도
+    let first_try = proxy::forward_request(
         &state.http_client,
-        method,
+        method.clone(),
         path,
         state.config.port_main_internal,
-        headers,
-        payload,
+        headers.clone(),
+        payload.clone(),
     )
-    .await
+    .await;
+
+    // 백엔드 다운(502 Connection Refused / Closed) 감지 시: 자동 재시작 후 1회 재시도
+    match first_try {
+        Ok(resp) => Ok(resp),
+        Err((StatusCode::BAD_GATEWAY, _)) => {
+            warn!("🩹 [SelfHeal] Main backend connection failed — auto-restarting and retrying...");
+            {
+                let _lock = state.swap_lock.lock().await;
+                state.process_mgr.stop_compact().await;
+                state.process_mgr.stop_comfy().await;
+                state
+                    .process_mgr
+                    .restart_main(
+                        &state.config.python_bin,
+                        &state.config.model_main_path,
+                        &state.config.model_mtp_path,
+                        state.config.port_main_internal,
+                        &state.config.prefill_step_size,
+                        &state.config.log_dir,
+                    )
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                let mut active = state.last_active_model.lock().await;
+                *active = "main".to_string();
+            }
+
+            // 2차 재시도
+            proxy::forward_request(
+                &state.http_client,
+                method,
+                path,
+                state.config.port_main_internal,
+                headers,
+                payload,
+            )
+            .await
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Port 1235 압축 프록시 요청 처리기 (온디맨드 자동 스왑)
@@ -475,7 +517,7 @@ async fn handle_compact_proxy(
     // 1. 요청 처리 전체 동안 스왑 락 유지 (처리 도중 Main 모델이 끼어들어 Compact 프로세스를 종료하는 레이스 컨디션 방지)
     let _lock = state.swap_lock.lock().await;
 
-    // Compact 모델로 스왑 (Main 중지 -> Compact 기동)
+    // 2. Compact 모델로 스왑 (Main 중지 -> Compact 기동)
     {
         let mut active = state.last_active_model.lock().await;
         if *active != "compact" {
@@ -506,16 +548,47 @@ async fn handle_compact_proxy(
         }
     }
 
-    // 2. 내부 18235 포트로 전달 (락 범위 내에서 안전하게 중계)
-    proxy::forward_request(
+    // 3. 🩹 [EAFP / Retry] 1차 프록시 전달 시도
+    let first_try = proxy::forward_request(
         &state.http_client,
-        method,
+        method.clone(),
         path,
         state.config.port_compact_internal,
-        headers,
-        payload,
+        headers.clone(),
+        payload.clone(),
     )
-    .await
+    .await;
+
+    // 백엔드 다운 감지 시: 자동 재시작 후 1회 재시도
+    match first_try {
+        Ok(resp) => Ok(resp),
+        Err((StatusCode::BAD_GATEWAY, _)) => {
+            warn!("🩹 [SelfHeal] Compact backend connection failed — auto-restarting and retrying...");
+            state
+                .process_mgr
+                .restart_compact(
+                    &state.config.python_bin,
+                    &state.config.model_compact_path,
+                    state.config.port_compact_internal,
+                    &state.config.prefill_step_size,
+                    &state.config.log_dir,
+                )
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            // 2차 재시도
+            proxy::forward_request(
+                &state.http_client,
+                method,
+                path,
+                state.config.port_compact_internal,
+                headers,
+                payload,
+            )
+            .await
+        }
+        Err(other) => Err(other),
+    }
 }
 
 #[cfg(test)]
