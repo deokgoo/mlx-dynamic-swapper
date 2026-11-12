@@ -102,7 +102,7 @@ status_mlx() {
         M_RSS=$(ps -o rss= -p "$M_PID" 2>/dev/null | tr -d ' ')
         M_RAM_MB=$((M_RSS / 1024))
         echo -e "${BOLD}MLX Dynamic Swapper:${NC} ${GREEN}ONLINE${NC} (Engine: ${ENGINE}, PID: $M_PID, RAM: ${M_RAM_MB}MB)"
-        echo -e "  Main (Qwen3.8-27B MTP):       http://127.0.0.1:${PORT_MAIN}/v1"
+        echo -e "  Main Endpoint:                http://127.0.0.1:${PORT_MAIN}/v1"
         echo -e "  Compactor (Gemma4-26B-A4B):   http://127.0.0.1:${PORT_COMPACT}/v1"
         if is_laya_running; then
             echo -e "  Laya Endpoint:                ${GREEN}http://127.0.0.1:${PORT_LAYA}/v1 (resident)${NC}"
@@ -122,11 +122,16 @@ status_mlx() {
         fi
 
         # Fallback to process search if API did not return model
-        if [ -z "$ACTIVE_PID" ] || [ "$ACTIVE_PID" = "None" ]; then
+        if [ -z "$ACTIVE_PID" ] || [ "$ACTIVE_PID" = "None" ] || [ "$ACTIVE_PID" = "0" ]; then
             PID_MAIN=$(get_main_pid)
             PID_COMPACT=$(get_compact_pid)
             if [ -n "$PID_MAIN" ]; then
-                ACTIVE_NAME="Qwen3.8-27B MTP (Main, 18234)"
+                MAIN_CMD=$(ps -o args= -p "$PID_MAIN" 2>/dev/null)
+                if [[ "$MAIN_CMD" == *"DeepSeek"* ]]; then
+                    ACTIVE_NAME="DeepSeek-R1-Distill-Qwen-14B (Main, 18234)"
+                else
+                    ACTIVE_NAME="Qwen3.8-27B MTP (Main, 18234)"
+                fi
                 ACTIVE_PID="$PID_MAIN"
             elif [ -n "$PID_COMPACT" ]; then
                 ACTIVE_NAME="Gemma4-26B-A4B (Compactor, 18235)"

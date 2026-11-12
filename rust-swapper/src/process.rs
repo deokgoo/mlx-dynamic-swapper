@@ -100,12 +100,12 @@ impl ProcessManager {
         }
     }
 
-    /// Main 모델(Qwen 27B + MTP) 기동
+    /// Main 모델 기동 (옵션으로 MTP 초안 모델 지정)
     pub async fn start_main(
         &self,
         python_bin: &Path,
         model_path: &Path,
-        mtp_path: &Path,
+        mtp_path: Option<&Path>,
         port: u16,
         prefill_step_size: &str,
         log_dir: &Path,
@@ -149,8 +149,11 @@ impl ProcessManager {
             .stdout(out_file)
             .stderr(err_file);
 
-        if mtp_path.exists() {
-            cmd.arg("--draft-model").arg(mtp_path);
+        if let Some(mtp) = mtp_path {
+            if mtp.exists() {
+                info!(target: "process", "⚡ Speculative Decoding Enabled: {:?}", mtp.file_name().unwrap_or_default());
+                cmd.arg("--draft-model").arg(mtp);
+            }
         }
 
         // 새 프로세스 세션/그룹 생성 (Python의 preexec_fn=os.setsid)
@@ -191,7 +194,7 @@ impl ProcessManager {
         &self,
         python_bin: &Path,
         model_path: &Path,
-        mtp_path: &Path,
+        mtp_path: Option<&Path>,
         port: u16,
         prefill_step_size: &str,
         log_dir: &Path,
@@ -380,5 +383,13 @@ impl ProcessManager {
 
     pub async fn is_comfy_running(&self) -> bool {
         self.comfy_proc.lock().await.is_some()
+    }
+
+    pub async fn get_main_pid(&self) -> Option<u32> {
+        self.main_proc.lock().await.as_ref().and_then(|p| p.child.id())
+    }
+
+    pub async fn get_compact_pid(&self) -> Option<u32> {
+        self.compact_proc.lock().await.as_ref().and_then(|p| p.child.id())
     }
 }

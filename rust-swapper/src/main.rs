@@ -18,6 +18,7 @@ use config::Config;
 use process::ProcessManager;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -31,6 +32,7 @@ pub struct AppState {
     pub http_client: Client,
     pub swap_lock: Arc<Mutex<()>>,
     pub last_active_model: Arc<Mutex<String>>,
+    pub current_main_model: Arc<Mutex<PathBuf>>,
     pub pipeline: Arc<pipeline::RequestPipeline>,
 }
 
@@ -50,10 +52,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. 환경 설정 로드
     let config = Config::from_env();
     info!("📂 Main Model: {:?}", config.model_main_path);
+    info!("📂 DeepSeek Model: {:?}", config.model_deepseek_path);
+    info!("📂 Qwen Model: {:?}", config.model_qwen_path);
     info!("📂 Compact Model: {:?}", config.model_compact_path);
 
     let process_mgr = ProcessManager::new();
     let http_client = Client::builder().build()?;
+
+    let initial_main_model = config.model_main_path.clone();
+    let initial_mtp = if initial_main_model == config.model_qwen_path {
+        Some(config.model_mtp_path.clone())
+    } else {
+        None
+    };
 
     let state = AppState {
         config: config.clone(),
@@ -61,19 +72,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client,
         swap_lock: Arc::new(Mutex::new(())),
         last_active_model: Arc::new(Mutex::new("main".to_string())),
+        current_main_model: Arc::new(Mutex::new(initial_main_model.clone())),
         pipeline: Arc::new(pipeline::RequestPipeline::build_default()),
     };
 
     // 3. 서버 시작 시 Main 모델 자동 기동
-    info!("⚡ Pre-warming Main Model on background...");
+    info!("⚡ Pre-warming Main Model on background: {:?}", initial_main_model.file_name().unwrap_or_default());
     let pm = process_mgr.clone();
     let conf = config.clone();
+    let init_model = initial_main_model.clone();
+    let init_mtp = initial_mtp.clone();
     tokio::spawn(async move {
         if let Err(e) = pm
             .start_main(
                 &conf.python_bin,
-                &conf.model_main_path,
-                &conf.model_mtp_path,
+                &init_model,
+                init_mtp.as_deref(),
                 conf.port_main_internal,
                 &conf.prefill_step_size,
                 &conf.log_dir,
@@ -227,17 +241,28 @@ async fn status_check(State(state): State<AppState>) -> impl IntoResponse {
     let main_running = state.process_mgr.is_main_running().await;
     let compact_running = state.process_mgr.is_compact_running().await;
     let active = state.last_active_model.lock().await.clone();
+    let current_main = state.current_main_model.lock().await.clone();
 
     let mut active_models = Vec::new();
     if active == "main" && main_running {
+        let name = if current_main == state.config.model_deepseek_path {
+            "DeepSeek-R1-Distill-Qwen-14B (Main, 18234)"
+        } else {
+            "Qwen3.8-27B MTP (Main, 18234)"
+        };
+        let pid = state.process_mgr.get_main_pid().await.unwrap_or(0);
         active_models.push(json!({
-            "name": "Qwen3.8-27B MTP (Main, 18234)",
-            "port": state.config.port_main_internal
+            "name": name,
+            "port": state.config.port_main_internal,
+            "model_path": current_main.to_string_lossy(),
+            "pid": pid
         }));
     } else if active == "compact" && compact_running {
+        let pid = state.process_mgr.get_compact_pid().await.unwrap_or(0);
         active_models.push(json!({
             "name": "Gemma4-26B-A4B (Compactor, 18235)",
-            "port": state.config.port_compact_internal
+            "port": state.config.port_compact_internal,
+            "pid": pid
         }));
     }
 
@@ -261,19 +286,32 @@ async fn props_check() -> impl IntoResponse {
 
 async fn models_main(State(state): State<AppState>) -> impl IntoResponse {
     let ctx_len = 65536;
-    let model_id = state.config.model_main_path.to_string_lossy().to_string();
+    let mut data = Vec::new();
+    let qwen_id = state.config.model_qwen_path.to_string_lossy().to_string();
+    data.push(json!({
+        "id": qwen_id,
+        "object": "model",
+        "owned_by": "mlx_main",
+        "context_length": ctx_len,
+        "max_context_length": ctx_len,
+        "max_tokens": 32768
+    }));
+
+    if state.config.model_deepseek_path.exists() {
+        let deepseek_id = state.config.model_deepseek_path.to_string_lossy().to_string();
+        data.push(json!({
+            "id": deepseek_id,
+            "object": "model",
+            "owned_by": "mlx_main",
+            "context_length": ctx_len,
+            "max_context_length": ctx_len,
+            "max_tokens": 32768
+        }));
+    }
+
     Json(json!({
         "object": "list",
-        "data": [
-            {
-                "id": model_id,
-                "object": "model",
-                "owned_by": "mlx_main",
-                "context_length": ctx_len,
-                "max_context_length": ctx_len,
-                "max_tokens": 32768
-            }
-        ]
+        "data": data
     }))
 }
 
@@ -329,12 +367,19 @@ async fn handle_comfy_run(
     info!("🎨 ComfyUI workflow finished. Stopping ComfyUI and restoring Main model...");
     state.process_mgr.stop_comfy().await;
 
+    let target_main = state.current_main_model.lock().await.clone();
+    let target_mtp = if target_main == state.config.model_qwen_path {
+        Some(state.config.model_mtp_path.clone())
+    } else {
+        None
+    };
+
     let _ = state
         .process_mgr
         .start_main(
             &state.config.python_bin,
-            &state.config.model_main_path,
-            &state.config.model_mtp_path,
+            &target_main,
+            target_mtp.as_deref(),
             state.config.port_main_internal,
             &state.config.prefill_step_size,
             &state.config.log_dir,
@@ -376,12 +421,20 @@ async fn handle_swap_lock(State(state): State<AppState>) -> impl IntoResponse {
 /// 외부 스크립트용 수동 스왑 언락 (`POST /v1/swap/unlock`)
 async fn handle_swap_unlock(State(state): State<AppState>) -> impl IntoResponse {
     state.process_mgr.stop_comfy().await;
+
+    let target_main = state.current_main_model.lock().await.clone();
+    let target_mtp = if target_main == state.config.model_qwen_path {
+        Some(state.config.model_mtp_path.clone())
+    } else {
+        None
+    };
+
     let _ = state
         .process_mgr
         .start_main(
             &state.config.python_bin,
-            &state.config.model_main_path,
-            &state.config.model_mtp_path,
+            &target_main,
+            target_mtp.as_deref(),
             state.config.port_main_internal,
             &state.config.prefill_step_size,
             &state.config.log_dir,
@@ -420,20 +473,59 @@ async fn handle_main_proxy(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, (StatusCode, String)> {
-    // 1. 필요한 경우 Main 모델로 스왑 복귀
+    // 0. 요청에서 타겟 모델 파악
+    let requested_model_path = if !body.is_empty() {
+        if let Ok(json_val) = serde_json::from_slice::<Value>(&body) {
+            if let Some(m) = json_val.get("model").and_then(|v| v.as_str()) {
+                if m.contains("Qwen3.8") || m.contains("27B") {
+                    state.config.model_qwen_path.clone()
+                } else if m.contains("DeepSeek") || m.contains("14B") {
+                    state.config.model_deepseek_path.clone()
+                } else {
+                    let cur = state.current_main_model.lock().await.clone();
+                    cur
+                }
+            } else {
+                let cur = state.current_main_model.lock().await.clone();
+                cur
+            }
+        } else {
+            let cur = state.current_main_model.lock().await.clone();
+            cur
+        }
+    } else {
+        let cur = state.current_main_model.lock().await.clone();
+        cur
+    };
+
+    let mtp_opt = if requested_model_path == state.config.model_qwen_path {
+        Some(state.config.model_mtp_path.clone())
+    } else {
+        None
+    };
+
+    // 1. 필요한 경우 Main 모델로 스왑 복귀 또는 모델 동적 전환
     {
         let _lock = state.swap_lock.lock().await;
         let mut active = state.last_active_model.lock().await;
-        if *active != "main" {
-            info!("🔄 Swapping back to Main Model...");
+        let mut current_main = state.current_main_model.lock().await;
+
+        if *active != "main" || *current_main != requested_model_path {
+            info!(
+                "🔄 Swapping Main Model to {:?}...",
+                requested_model_path.file_name().unwrap_or_default()
+            );
             state.process_mgr.stop_compact().await;
             state.process_mgr.stop_comfy().await;
+            if *current_main != requested_model_path {
+                state.process_mgr.stop_main().await;
+            }
             state
                 .process_mgr
                 .start_main(
                     &state.config.python_bin,
-                    &state.config.model_main_path,
-                    &state.config.model_mtp_path,
+                    &requested_model_path,
+                    mtp_opt.as_deref(),
                     state.config.port_main_internal,
                     &state.config.prefill_step_size,
                     &state.config.log_dir,
@@ -441,6 +533,7 @@ async fn handle_main_proxy(
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
             *active = "main".to_string();
+            *current_main = requested_model_path.clone();
         }
     }
 
@@ -449,7 +542,7 @@ async fn handle_main_proxy(
     let mut payload = None;
     if !body.is_empty() {
         if let Ok(mut json_val) = serde_json::from_slice::<Value>(&body) {
-            let model_path_str = state.config.model_main_path.to_string_lossy().to_string();
+            let model_path_str = requested_model_path.to_string_lossy().to_string();
             state.pipeline.execute(&model_path_str, &mut json_val);
             payload = Some(json_val);
         }
@@ -479,8 +572,8 @@ async fn handle_main_proxy(
                     .process_mgr
                     .restart_main(
                         &state.config.python_bin,
-                        &state.config.model_main_path,
-                        &state.config.model_mtp_path,
+                        &requested_model_path,
+                        mtp_opt.as_deref(),
                         state.config.port_main_internal,
                         &state.config.prefill_step_size,
                         &state.config.log_dir,
@@ -489,6 +582,8 @@ async fn handle_main_proxy(
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
                 let mut active = state.last_active_model.lock().await;
                 *active = "main".to_string();
+                let mut current_main = state.current_main_model.lock().await;
+                *current_main = requested_model_path.clone();
             }
 
             // 2차 재시도
@@ -600,12 +695,14 @@ mod http_tests {
     use tower::ServiceExt;
 
     fn setup_test_app() -> AppState {
+        let conf = Config::from_env();
         AppState {
-            config: Config::from_env(),
+            config: conf.clone(),
             process_mgr: ProcessManager::new(),
             http_client: Client::new(),
             swap_lock: Arc::new(Mutex::new(())),
             last_active_model: Arc::new(Mutex::new("main".to_string())),
+            current_main_model: Arc::new(Mutex::new(conf.model_main_path.clone())),
             pipeline: Arc::new(pipeline::RequestPipeline::build_default()),
         }
     }

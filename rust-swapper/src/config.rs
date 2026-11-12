@@ -16,6 +16,8 @@ use std::path::PathBuf;
 pub struct Config {
     pub python_bin: PathBuf,
     pub model_main_path: PathBuf,
+    pub model_deepseek_path: PathBuf,
+    pub model_qwen_path: PathBuf,
     pub model_mtp_path: PathBuf,
     pub model_compact_path: PathBuf,
 
@@ -46,9 +48,17 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| home_path.join(".mlx-server/bin/python"));
 
-        let model_main_path = std::env::var("MODEL_MAIN_PATH")
+        let model_deepseek_path = std::env::var("MODEL_DEEPSEEK_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_path.join(".mlx-models/DeepSeek-R1-Distill-Qwen-14B-4bit"));
+
+        let model_qwen_path = std::env::var("MODEL_QWEN_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| home_path.join(".mlx-models/Qwen3.8-27B-4bit"));
+
+        let model_main_path = std::env::var("MODEL_MAIN_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| model_qwen_path.clone());
 
         let model_mtp_path = std::env::var("MODEL_MTP_PATH")
             .map(PathBuf::from)
@@ -117,6 +127,8 @@ impl Config {
         Self {
             python_bin,
             model_main_path,
+            model_deepseek_path,
+            model_qwen_path,
             model_mtp_path,
             model_compact_path,
             port_main_internal,
