@@ -30,6 +30,47 @@ impl PayloadFilter for ThinkingNormalizerFilter {
             }
         }
 
+        // 1. Hermes의 빈 응답/추론 복구 넛지 턴 감지 시 Thinking 즉시 OFF (이미 끝난 추론을 바탕으로 즉시 본문 합성)
+        let is_recovery_nudge = obj.get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|arr| arr.last())
+            .map(|last_msg| {
+                let role = last_msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                let content = last_msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                role == "user" && (
+                    content.contains("추론이 완료되었습니다")
+                    || content.contains("최종 답변 본문을 명확하게 작성")
+                    || content.contains("_empty_recovery_synthetic")
+                )
+            })
+            .unwrap_or(false);
+
+        if is_recovery_nudge {
+            chat_template_kwargs.insert("enable_thinking".to_string(), json!(false));
+            chat_template_kwargs.remove("reasoning_effort");
+            obj.remove("reasoning_effort");
+            obj.insert("chat_template_kwargs".to_string(), Value::Object(chat_template_kwargs));
+            info!(target: "pipeline", "🧠 [ThinkingNormalizer] Recovery nudge detected -> Force thinking OFF for direct answer synthesis");
+            ctx.record_modified(self.name());
+            return Ok(());
+        }
+
+        // 2. chat_template_kwargs에 enable_thinking: false가 명시된 경우 존중
+        let explicit_thinking_off = chat_template_kwargs
+            .get("enable_thinking")
+            .and_then(|v| v.as_bool())
+            == Some(false);
+
+        if explicit_thinking_off {
+            chat_template_kwargs.insert("enable_thinking".to_string(), json!(false));
+            chat_template_kwargs.remove("reasoning_effort");
+            obj.remove("reasoning_effort");
+            obj.insert("chat_template_kwargs".to_string(), Value::Object(chat_template_kwargs));
+            info!(target: "pipeline", "🧠 [ThinkingNormalizer] Thinking OFF via chat_template_kwargs");
+            ctx.record_modified(self.name());
+            return Ok(());
+        }
+
         // Hermes reasoning_effort 추출 및 표준화
         let raw_effort = obj
             .get("reasoning_effort")
@@ -69,5 +110,53 @@ impl PayloadFilter for ThinkingNormalizerFilter {
         obj.insert("chat_template_kwargs".to_string(), Value::Object(chat_template_kwargs));
         ctx.record_modified(self.name());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_thinking_normalizer_recovery_nudge() {
+        let filter = ThinkingNormalizerFilter;
+        let mut ctx = PipelineContext::new("qwen");
+
+        let mut payload = json!({
+            "model": "any",
+            "reasoning_effort": "medium",
+            "messages": [
+                {"role": "user", "content": "질문"},
+                {"role": "assistant", "content": "(empty)"},
+                {"role": "user", "content": "추론이 완료되었습니다. 위 추론 내용을 바탕으로 사용자에게 전달할 최종 답변 본문을 명확하게 작성해주세요."}
+            ]
+        });
+
+        filter.apply(&mut ctx, &mut payload).unwrap();
+
+        assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(payload.get("reasoning_effort").is_none());
+        assert!(ctx.modified_layers.contains(&"ThinkingNormalizer"));
+    }
+
+    #[test]
+    fn test_thinking_normalizer_explicit_chat_template_kwargs_off() {
+        let filter = ThinkingNormalizerFilter;
+        let mut ctx = PipelineContext::new("qwen");
+
+        let mut payload = json!({
+            "model": "any",
+            "chat_template_kwargs": {
+                "enable_thinking": false
+            },
+            "messages": [
+                {"role": "user", "content": "질문"}
+            ]
+        });
+
+        filter.apply(&mut ctx, &mut payload).unwrap();
+
+        assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(payload.get("reasoning_effort").is_none());
     }
 }

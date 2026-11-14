@@ -29,83 +29,110 @@ impl PayloadFilter for AntiLoopGuardFilter {
                 return Ok(());
             }
 
-            // 1. 중복 도구 호출(Duplicate Tool Calls) 루프 감지
-            let mut assistant_tool_calls: Vec<Vec<(String, String)>> = Vec::new();
-            for msg in messages.iter().rev() {
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                if role == "assistant" {
-                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
-                        let mut calls = Vec::new();
-                        for call in tool_calls {
-                            if let Some(func) = call.get("function") {
-                                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                                let raw_args = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
-                                // JSON 정규화 (공백/키 순서 무시 비교)
-                                let normalized_args = match serde_json::from_str::<Value>(raw_args) {
-                                    Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| raw_args.trim().to_string()),
-                                    Err(_) => raw_args.trim().to_string(),
-                                };
-                                if !name.is_empty() {
-                                    calls.push((name, normalized_args));
+            let last_msg = messages.last();
+            let last_role = last_msg
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            let last_content = last_msg
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+
+            // Hermes 복구 넛지 턴 감지 (추론 완료 후 본문 작성 요청)
+            let is_recovery_nudge = last_role == "user" && (
+                last_content.contains("추론이 완료되었습니다")
+                || last_content.contains("최종 답변 본문을 명확하게 작성")
+                || last_content.contains("_empty_recovery_synthetic")
+            );
+
+            // 1. 중복 도구 호출(Duplicate Tool Calls) 루프 감지:
+            // 도구 실행 직후(last_role == "tool")이며 복구 넛지가 아닐 때만 평가
+            if last_role == "tool" && !is_recovery_nudge {
+                let mut assistant_tool_calls: Vec<Vec<(String, String)>> = Vec::new();
+                for msg in messages.iter().rev() {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role == "user" {
+                        // 현재 사용자 턴 이전의 도구 호출은 현재 도구 루프와 분리
+                        break;
+                    }
+                    if role == "assistant" {
+                        if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                            let mut calls = Vec::new();
+                            for call in tool_calls {
+                                if let Some(func) = call.get("function") {
+                                    let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                                    let raw_args = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+                                    // JSON 정규화 (공백/키 순서 무시 비교)
+                                    let normalized_args = match serde_json::from_str::<Value>(raw_args) {
+                                        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| raw_args.trim().to_string()),
+                                        Err(_) => raw_args.trim().to_string(),
+                                    };
+                                    if !name.is_empty() {
+                                        calls.push((name, normalized_args));
+                                    }
                                 }
                             }
-                        }
-                        if !calls.is_empty() {
-                            assistant_tool_calls.push(calls);
+                            if !calls.is_empty() {
+                                assistant_tool_calls.push(calls);
+                            }
                         }
                     }
-                }
-                if assistant_tool_calls.len() >= 6 {
-                    break;
-                }
-            }
-
-            // 패턴 A: 최근 턴과 직전 턴 비교 (연속 호출)
-            if assistant_tool_calls.len() >= 2 {
-                let latest_calls = &assistant_tool_calls[0];
-                let prev_calls = &assistant_tool_calls[1];
-
-                for (name, args) in latest_calls {
-                    if prev_calls.iter().any(|(p_name, p_args)| p_name == name && p_args == args) {
-                        duplicate_tool_detected = Some(name.clone());
+                    if assistant_tool_calls.len() >= 6 {
                         break;
                     }
                 }
-            }
 
-            // 패턴 B: 최근 턴이 과거 히스토리 내의 호출과 일치 (누적 중복)
-            if duplicate_tool_detected.is_none() && !assistant_tool_calls.is_empty() {
-                if let Some(latest_calls) = assistant_tool_calls.first() {
+                // 패턴 A: 최근 턴과 직전 턴 비교 (연속 호출)
+                if assistant_tool_calls.len() >= 2 {
+                    let latest_calls = &assistant_tool_calls[0];
+                    let prev_calls = &assistant_tool_calls[1];
+
                     for (name, args) in latest_calls {
-                        let occurrences = assistant_tool_calls
-                            .iter()
-                            .filter(|turn| turn.iter().any(|(n, a)| n == name && a == args))
-                            .count();
-                        if occurrences >= 2 {
+                        if prev_calls.iter().any(|(p_name, p_args)| p_name == name && p_args == args) {
                             duplicate_tool_detected = Some(name.clone());
                             break;
                         }
                     }
                 }
+
+                // 패턴 B: 최근 턴이 과거 히스토리 내의 호출과 일치 (누적 중복)
+                if duplicate_tool_detected.is_none() && !assistant_tool_calls.is_empty() {
+                    if let Some(latest_calls) = assistant_tool_calls.first() {
+                        for (name, args) in latest_calls {
+                            let occurrences = assistant_tool_calls
+                                .iter()
+                                .filter(|turn| turn.iter().any(|(n, a)| n == name && a == args))
+                                .count();
+                            if occurrences >= 2 {
+                                duplicate_tool_detected = Some(name.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
-            // 2. 도구 실행 에러(Tool Failure) 감지
-            for msg in messages.iter().rev().take(4) {
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                if role == "tool" {
-                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let is_error = content.contains("\"success\": false")
-                        || content.contains("Exception")
-                        || content.contains("failed")
-                        || content.contains("Error")
-                        || content.contains("is mandatory")
-                        || content.contains("BLOCKED:");
+            // 2. 도구 실행 에러(Tool Failure) 감지:
+            // 직전 도구 실행에서 에러 발생 시 재시도에서 동일 에러 반복 방지 가이드 주입 (복구 넛지 턴은 제외)
+            if !is_recovery_nudge {
+                for msg in messages.iter().rev().take(4) {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role == "tool" {
+                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let is_error = content.contains("\"success\": false")
+                            || content.contains("Exception")
+                            || content.contains("failed")
+                            || content.contains("Error")
+                            || content.contains("is mandatory")
+                            || content.contains("BLOCKED:");
 
-                    if is_error {
-                        let tool_name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                        let error_snippet: String = content.chars().take(140).collect();
-                        failed_tool_info = Some((tool_name.to_string(), error_snippet));
-                        break;
+                        if is_error {
+                            let tool_name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                            let error_snippet: String = content.chars().take(140).collect();
+                            failed_tool_info = Some((tool_name.to_string(), error_snippet));
+                            break;
+                        }
                     }
                 }
             }
@@ -117,7 +144,11 @@ impl PayloadFilter for AntiLoopGuardFilter {
                     You have called '{dup_tool}' with identical arguments repeatedly.\n\
                     ⚠️ Tool calling has been TEMPORARILY DISABLED (tool_choice='none').\n\
                     You CANNOT make any more tool calls this turn.\n\
-                    You MUST now use the results already gathered above to formulate your final comprehensive answer in Korean and reply to the user directly.\n"
+                    You MUST now use the results already gathered above to formulate your final comprehensive answer in Korean and reply to the user directly.\n\
+                    CRITICAL INSTRUCTION FOR REASONING/THINKING:\n\
+                    - Conclude your internal thinking immediately.\n\
+                    - You MUST output your final comprehensive answer in visible Korean text outside any <think> block.\n\
+                    - Do NOT finish your generation without producing visible response content for the user.\n"
                 ))
             } else if let Some((ref tool_name, ref error_snippet)) = failed_tool_info {
                 Some(format!(
@@ -339,5 +370,71 @@ mod tests {
         assert!(!sys_content.contains("[CRITICAL RUNTIME GUIDANCE"));
         assert!(!ctx.modified_layers.contains(&"AntiLoopGuard"));
         assert!(payload.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn test_anti_loop_duplicate_call_ignored_on_user_nudge() {
+        let filter = AntiLoopGuardFilter;
+        let mut ctx = PipelineContext::new("qwen");
+
+        let mut payload = json!({
+            "tools": [{"type": "function", "function": {"name": "terminal"}}],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Base prompt."
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{\"command\":\"ls\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "name": "terminal",
+                    "content": "Traceback: FileNotFoundError"
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "c2",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{\"command\":\"ls\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c2",
+                    "name": "terminal",
+                    "content": "Traceback: FileNotFoundError"
+                },
+                {
+                    "role": "assistant",
+                    "content": "(empty)"
+                },
+                {
+                    "role": "user",
+                    "content": "추론이 완료되었습니다. 위 추론 내용을 바탕으로 사용자에게 전달할 최종 답변 본문을 명확하게 작성해주세요."
+                }
+            ]
+        });
+
+        filter.apply(&mut ctx, &mut payload).unwrap();
+
+        // 사용자 복구 턴에서는 중복 도구 호출 하드 블록 및 가이드 주입이 실행되지 않아야 함
+        assert!(payload.get("tool_choice").is_none());
+        let sys_content = payload["messages"][0]["content"].as_str().unwrap();
+        assert!(!sys_content.contains("[CRITICAL RUNTIME GUIDANCE"));
+        assert!(!ctx.modified_layers.contains(&"AntiLoopGuard"));
     }
 }
