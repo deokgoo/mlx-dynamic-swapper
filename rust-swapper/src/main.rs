@@ -52,7 +52,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. 환경 설정 로드
     let config = Config::from_env();
     info!("📂 Main Model: {:?}", config.model_main_path);
-    info!("📂 DeepSeek Model: {:?}", config.model_deepseek_path);
     info!("📂 Qwen Model: {:?}", config.model_qwen_path);
     info!("📂 Compact Model: {:?}", config.model_compact_path);
 
@@ -245,11 +244,7 @@ async fn status_check(State(state): State<AppState>) -> impl IntoResponse {
 
     let mut active_models = Vec::new();
     if active == "main" && main_running {
-        let name = if current_main == state.config.model_deepseek_path {
-            "DeepSeek-R1-Distill-Qwen-14B (Main, 18234)"
-        } else {
-            "Qwen3.8-27B MTP (Main, 18234)"
-        };
+        let name = "Qwen3.8-27B MTP (Main, 18234)";
         let pid = state.process_mgr.get_main_pid().await.unwrap_or(0);
         active_models.push(json!({
             "name": name,
@@ -296,18 +291,6 @@ async fn models_main(State(state): State<AppState>) -> impl IntoResponse {
         "max_context_length": ctx_len,
         "max_tokens": 32768
     }));
-
-    if state.config.model_deepseek_path.exists() {
-        let deepseek_id = state.config.model_deepseek_path.to_string_lossy().to_string();
-        data.push(json!({
-            "id": deepseek_id,
-            "object": "model",
-            "owned_by": "mlx_main",
-            "context_length": ctx_len,
-            "max_context_length": ctx_len,
-            "max_tokens": 32768
-        }));
-    }
 
     Json(json!({
         "object": "list",
@@ -479,8 +462,6 @@ async fn handle_main_proxy(
             if let Some(m) = json_val.get("model").and_then(|v| v.as_str()) {
                 if m.contains("Qwen3.8") || m.contains("27B") {
                     state.config.model_qwen_path.clone()
-                } else if m.contains("DeepSeek") || m.contains("14B") {
-                    state.config.model_deepseek_path.clone()
                 } else {
                     let cur = state.current_main_model.lock().await.clone();
                     cur
