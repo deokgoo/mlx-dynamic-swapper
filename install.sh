@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_DIR="$HOME/.mlx-server"
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+PLIST_FILE="$LAUNCH_AGENTS_DIR/ai.mlx.server.plist"
+
+echo "=== MLX Dynamic Model Swapper Installer ==="
+
+# 1. Ensure target directory exists
+mkdir -p "$TARGET_DIR"
+mkdir -p "$HOME/.local/bin"
+
+# 2. Build and install Rust native swapper
+echo "[1/4] Building rust-swapper in release mode..."
+mkdir -p "$TARGET_DIR/bin"
+(cd "$SCRIPT_DIR/rust-swapper" && cargo build --release)
+cp "$SCRIPT_DIR/rust-swapper/target/release/mlx-swapper" "$TARGET_DIR/bin/mlx-swapper"
+chmod +x "$TARGET_DIR/bin/mlx-swapper"
+
+# 3. Install CLI tool and configuration
+echo "[2/4] Installing mlx CLI and default configuration..."
+ln -sf "$SCRIPT_DIR/bin/mlx" "$HOME/.local/bin/mlx"
+chmod +x "$HOME/.local/bin/mlx"
+
+if [ ! -f "$TARGET_DIR/config.toml" ]; then
+    echo "Creating default configuration at $TARGET_DIR/config.toml..."
+    cp "$SCRIPT_DIR/config.example.toml" "$TARGET_DIR/config.toml"
+fi
+
+# 4. Generate and copy LaunchAgent plist
+echo "[3/4] Configuring macOS LaunchAgent..."
+mkdir -p "$LAUNCH_AGENTS_DIR"
+sed "s|{{HOME}}|$HOME|g" "$SCRIPT_DIR/ai.mlx.server.plist.template" > "$PLIST_FILE"
+
+# 5. Load LaunchAgent
+echo "[4/4] Starting service via launchctl..."
+launchctl unload "$PLIST_FILE" 2>/dev/null || true
+launchctl load "$PLIST_FILE"
+
+echo "✔ Installation complete!"
+echo "Check status with: mlx status"
+echo "View logs with:   mlx logs"

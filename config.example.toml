@@ -1,0 +1,47 @@
+# MLX Dynamic Model Swapper Configuration Template
+# Copy this file to ~/.mlx-server/config.toml or set MLX_CONFIG_PATH
+
+[server]
+# Proxy listening ports
+proxy_port_main = 1234
+proxy_port_compact = 1235
+
+# Internal backend ports for MLX servers
+port_main_internal = 18234
+port_compact_internal = 18235
+
+# Chunk prefill step size (1024 recommended for M-series Max/Ultra)
+prefill_step_size = "1024"
+
+[models]
+# Main LLM model directory (e.g. DeepSeek-R1, Qwen3.8, Llama-3)
+main_path = "~/.mlx-models/DeepSeek-R1-Distill-Qwen-14B-4bit"
+
+# Optional MTP (Multi-Token Prediction) draft model path for spec decoding
+# Set qwen_path to the base model path and mtp_path to the draft model
+qwen_path = "~/.mlx-models/Qwen3.8-27B-4bit"
+mtp_path = "~/.mlx-models/Qwen3.8-27B-MTP-4bit"
+
+# Ultra-light auxiliary model for context compaction / summarization
+compact_path = "~/.mlx-models/gemma-4-26b-a4b-it-4bit"
+
+[comfyui]
+# Enable on-demand ComfyUI image generation with zero VRAM leak
+# When an image task runs, the main LLM is safely unloaded to free Metal VRAM,
+# ComfyUI generates the image, and the LLM is automatically restored.
+python_bin = "~/ComfyUI/.venv/bin/python3"
+main_py = "~/ComfyUI/main.py"
+port = 8188
+input_dir = "~/ComfyUI/input"
+output_dir = "~/ComfyUI/output"
+workflows_dir = "~/ComfyUI/workflows"
+
+[paths]
+# Python binary with mlx_lm installed
+python_bin = "~/.mlx-server/bin/python"
+
+# Directory for server logs
+log_dir = "~/.mlx-server"
+
+# Web dashboard static files (optional)
+web_dist_dir = "./web/dist"

@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+
+# Rust
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Web / Node
+**/node_modules/
+**/dist/
+
+# Logs
+*.log
+*.error.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
