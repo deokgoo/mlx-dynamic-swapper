@@ -32,3 +32,6 @@ nix = { version = "0.29", features = ["signal", "process"] }
 # 로깅 및 트레이싱 (Python의 print/logging 역할)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1.38", features = ["test-util"] }
