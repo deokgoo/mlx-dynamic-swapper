@@ -379,11 +379,13 @@ async fn handle_comfy_run(
 }
 
 /// 외부 스크립트용 수동 스왑 락 (`POST /v1/swap/lock`)
-async fn handle_swap_lock(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_swap_lock(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let _lock = state.swap_lock.lock().await;
     state.process_mgr.stop_main().await;
     state.process_mgr.stop_compact().await;
-    let _ = state
+    if let Err(error) = state
         .process_mgr
         .start_comfy(
             &state.config.comfy_python_bin,
@@ -393,16 +395,23 @@ async fn handle_swap_lock(State(state): State<AppState>) -> impl IntoResponse {
             &state.config.comfy_output_dir,
             &state.config.log_dir,
         )
-        .await;
+        .await
+    {
+        state.process_mgr.stop_comfy().await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
+    }
 
     let mut active = state.last_active_model.lock().await;
     *active = "comfyui".to_string();
 
-    Json(json!({"status": "locked", "target": "comfyui"}))
+    Ok(Json(json!({"status": "locked", "target": "comfyui"})))
 }
 
 /// 외부 스크립트용 수동 스왑 언락 (`POST /v1/swap/unlock`)
-async fn handle_swap_unlock(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_swap_unlock(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let _lock = state.swap_lock.lock().await;
     state.process_mgr.stop_comfy().await;
 
     let target_main = state.current_main_model.lock().await.clone();
@@ -412,7 +421,7 @@ async fn handle_swap_unlock(State(state): State<AppState>) -> impl IntoResponse 
         None
     };
 
-    let _ = state
+    if let Err(error) = state
         .process_mgr
         .start_main(
             &state.config.python_bin,
@@ -422,12 +431,16 @@ async fn handle_swap_unlock(State(state): State<AppState>) -> impl IntoResponse 
             &state.config.prefill_step_size,
             &state.config.log_dir,
         )
-        .await;
+        .await
+    {
+        state.process_mgr.stop_main().await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
+    }
 
     let mut active = state.last_active_model.lock().await;
     *active = "main".to_string();
 
-    Json(json!({"status": "unlocked", "active_model": "main"}))
+    Ok(Json(json!({"status": "unlocked", "active_model": "main"})))
 }
 
 async fn models_compact(State(state): State<AppState>) -> impl IntoResponse {
@@ -686,6 +699,143 @@ mod http_tests {
             current_main_model: Arc::new(Mutex::new(conf.model_main_path.clone())),
             pipeline: Arc::new(pipeline::RequestPipeline::build_default()),
         }
+    }
+
+    struct StartupFailureFixture {
+        state: AppState,
+        log_dir: PathBuf,
+    }
+
+    impl StartupFailureFixture {
+        fn new(active_model: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let log_dir = std::env::temp_dir().join(format!(
+                "mlx-swapper-startup-test-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&log_dir).unwrap();
+
+            let mut state = setup_test_app();
+            state.config.log_dir = log_dir.clone();
+            state.config.python_bin = log_dir.join("missing-python");
+            state.config.comfy_python_bin = log_dir.join("missing-comfy-python");
+            state.config.port_main_internal = Self::unused_port();
+            state.config.comfy_port = Self::unused_port();
+            state.last_active_model = Arc::new(Mutex::new(active_model.to_string()));
+
+            Self { state, log_dir }
+        }
+
+        fn unused_port() -> u16 {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+    }
+
+    impl Drop for StartupFailureFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.log_dir);
+        }
+    }
+
+    async fn post_swap(state: AppState, path: &str) -> Response {
+        create_main_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn assert_startup_error(response: Response, expected: &str) {
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains(expected), "Unexpected error: {message}");
+    }
+
+    #[tokio::test]
+    async fn test_swap_lock_reports_spawn_failure_without_activating_comfy() {
+        let fixture = StartupFailureFixture::new("main");
+
+        let response = post_swap(fixture.state.clone(), "/v1/swap/lock").await;
+
+        assert_startup_error(response, "Failed to spawn ComfyUI").await;
+        assert_eq!(*fixture.state.last_active_model.lock().await, "main");
+        assert!(!fixture.state.process_mgr.is_comfy_running().await);
+    }
+
+    #[tokio::test]
+    async fn test_swap_unlock_reports_spawn_failure_without_activating_main() {
+        let fixture = StartupFailureFixture::new("comfyui");
+
+        let response = post_swap(fixture.state.clone(), "/v1/swap/unlock").await;
+
+        assert_startup_error(response, "Failed to spawn main model").await;
+        assert_eq!(*fixture.state.last_active_model.lock().await, "comfyui");
+        assert!(!fixture.state.process_mgr.is_main_running().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_swap_lock_cleans_up_timed_out_backend_before_retry() {
+        let mut fixture = StartupFailureFixture::new("main");
+        // The test executable rejects this flag and never opens a backend port.
+        fixture.state.config.comfy_python_bin = std::env::current_exe().unwrap();
+        fixture.state.config.comfy_main_py = PathBuf::from("--not-a-model-server");
+
+        let response = post_swap(fixture.state.clone(), "/v1/swap/lock").await;
+
+        assert_startup_error(response, "ComfyUI backend timed out").await;
+        assert!(!fixture.state.process_mgr.is_comfy_running().await);
+        assert_eq!(*fixture.state.last_active_model.lock().await, "main");
+
+        fixture.state.config.comfy_python_bin = fixture.log_dir.join("missing-comfy-python");
+        let response = post_swap(fixture.state.clone(), "/v1/swap/lock").await;
+        assert_startup_error(response, "Failed to spawn ComfyUI").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_swap_unlock_cleans_up_timed_out_backend_before_retry() {
+        let mut fixture = StartupFailureFixture::new("comfyui");
+        // MLX's -m argument is invalid for the test executable, so it never listens.
+        fixture.state.config.python_bin = std::env::current_exe().unwrap();
+
+        let response = post_swap(fixture.state.clone(), "/v1/swap/unlock").await;
+
+        assert_startup_error(response, "Main model timed out").await;
+        assert!(!fixture.state.process_mgr.is_main_running().await);
+        assert_eq!(*fixture.state.last_active_model.lock().await, "comfyui");
+
+        fixture.state.config.python_bin = fixture.log_dir.join("missing-python");
+        let response = post_swap(fixture.state.clone(), "/v1/swap/unlock").await;
+        assert_startup_error(response, "Failed to spawn main model").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_swap_unlock_waits_for_swap_lock() {
+        let fixture = StartupFailureFixture::new("comfyui");
+        let guard = fixture.state.swap_lock.lock().await;
+        let request = post_swap(fixture.state.clone(), "/v1/swap/unlock");
+        tokio::pin!(request);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), request.as_mut())
+                .await
+                .is_err()
+        );
+
+        drop(guard);
+        assert_startup_error(request.await, "Failed to spawn main model").await;
     }
 
     #[tokio::test]
