@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { throwForApiError } from './api';
 import {
   Activity,
   Cpu,
@@ -128,15 +129,17 @@ export default function App() {
     const isLocked = stats?.is_locked;
     const targetUrl = isLocked ? '/v1/swap/unlock' : '/v1/swap/lock';
     const actionName = isLocked ? 'Unlock' : 'Lock';
+    setActionResult(null);
     setActionLoading(actionName);
     try {
       const res = await fetch(targetUrl, { method: 'POST' });
+      await throwForApiError(res);
       const json = await res.json();
       addLog('swap', `스왑 락 변경: ${JSON.stringify(json)}`);
       setActionResult(`${actionName} 완료`);
       fetchStats();
-    } catch (err: any) {
-      addLog('warn', `스왑 락 오류: ${err.message}`);
+    } catch (err) {
+      addLog('warn', `스왑 락 오류: ${err instanceof Error ? err.message : '요청 실패'}`);
     } finally {
       setActionLoading(null);
     }
@@ -147,6 +150,7 @@ export default function App() {
     if (!confirm('ComfyUI 테스트를 실행하시겠습니까? 메인 LLM이 일시 중지되고 VRAM이 ComfyUI에 할당됩니다.')) {
       return;
     }
+    setActionResult(null);
     setActionLoading('comfy');
     addLog('swap', '🎨 ComfyUI 온디맨드 스왑 시작: LLM 중지 -> ComfyUI 기동 요청');
     try {
@@ -158,16 +162,13 @@ export default function App() {
           prompt: 'A cute futuristic robot on Apple Silicon M5 Max desk, cyberpunk neon vibe',
         }),
       });
+      await throwForApiError(res);
       const data = await res.json();
-      if (res.ok) {
-        addLog('success', `✔ ComfyUI 실행 성공! 결과 파일: ${data.files?.join(', ') || '생성 완료'}`);
-        setActionResult('ComfyUI 워크플로우 정상 완료!');
-      } else {
-        addLog('warn', `ComfyUI 실행 에러: ${data.error || '실패'}`);
-      }
+      addLog('success', `✔ ComfyUI 실행 성공! 결과 파일: ${data.files?.join(', ') || '생성 완료'}`);
+      setActionResult('ComfyUI 워크플로우 정상 완료!');
       fetchStats();
-    } catch (err: any) {
-      addLog('warn', `ComfyUI 통신 오류: ${err.message}`);
+    } catch (err) {
+      addLog('warn', `ComfyUI 실행 오류: ${err instanceof Error ? err.message : '요청 실패'}`);
     } finally {
       setActionLoading(null);
     }
