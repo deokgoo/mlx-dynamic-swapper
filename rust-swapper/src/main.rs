@@ -9,6 +9,9 @@ mod pipeline;
 mod process;
 mod proxy;
 
+#[cfg(test)]
+mod proxy_tests;
+
 use axum::extract::State;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Json, Redirect, Response};
@@ -519,7 +522,6 @@ async fn handle_main_proxy(
     }
 
     // 2. 바디 JSON 페이로드 가공 (A -> B -> C 순차 Inbound 파이프라인)
-    let path = uri.path();
     let mut payload = None;
     if !body.is_empty() {
         if let Ok(mut json_val) = serde_json::from_slice::<Value>(&body) {
@@ -533,7 +535,7 @@ async fn handle_main_proxy(
     let first_try = proxy::forward_request(
         &state.http_client,
         method.clone(),
-        path,
+        &uri,
         state.config.port_main_internal,
         headers.clone(),
         payload.clone(),
@@ -571,7 +573,7 @@ async fn handle_main_proxy(
             proxy::forward_request(
                 &state.http_client,
                 method,
-                path,
+                &uri,
                 state.config.port_main_internal,
                 headers,
                 payload,
@@ -614,7 +616,6 @@ async fn handle_compact_proxy(
         }
     }
 
-    let path = uri.path();
     let mut payload = None;
     if !body.is_empty() {
         if let Ok(mut json_val) = serde_json::from_slice::<Value>(&body) {
@@ -628,7 +629,7 @@ async fn handle_compact_proxy(
     let first_try = proxy::forward_request(
         &state.http_client,
         method.clone(),
-        path,
+        &uri,
         state.config.port_compact_internal,
         headers.clone(),
         payload.clone(),
@@ -656,7 +657,7 @@ async fn handle_compact_proxy(
             proxy::forward_request(
                 &state.http_client,
                 method,
-                path,
+                &uri,
                 state.config.port_compact_internal,
                 headers,
                 payload,

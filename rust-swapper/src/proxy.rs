@@ -10,7 +10,7 @@
 //!     비동기 무복사(Zero-copy)에 가까운 초고속 SSE 중계를 실현합니다.
 
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
 use axum::response::Response;
 use reqwest::Client;
 use serde_json::Value;
@@ -20,12 +20,13 @@ use tracing::error;
 pub async fn forward_request(
     client: &Client,
     method: Method,
-    uri_path: &str,
+    uri: &Uri,
     target_port: u16,
     headers: HeaderMap,
     payload: Option<Value>,
 ) -> Result<Response, (StatusCode, String)> {
-    let target_url = format!("http://127.0.0.1:{}{}", target_port, uri_path);
+    let request_target = uri.path_and_query().map_or("/", |target| target.as_str());
+    let target_url = format!("http://127.0.0.1:{}{}", target_port, request_target);
 
     let mut req_builder = client.request(method.clone(), &target_url);
 
