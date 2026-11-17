@@ -17,6 +17,7 @@ use axum::Router;
 use config::Config;
 use process::ProcessManager;
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -136,6 +137,8 @@ pub fn create_main_router(state: AppState) -> Router {
         .route("/v1/models", get(models_main))
         .route("/models", get(models_main))
         .route("/v1/system/stats", get(system_stats_handler))
+        .route("/v1/system/models", get(system_models_handler))
+        .route("/v1/system/switch-model", post(handle_system_switch_model))
         .route("/v1/comfy/run", post(handle_comfy_run))
         .route("/v1/swap/lock", post(handle_swap_lock))
         .route("/v1/swap/unlock", post(handle_swap_unlock))
@@ -175,6 +178,22 @@ async fn get_process_rss_mb(pid: u32) -> Option<u64> {
     Some(kb / 1024)
 }
 
+async fn get_total_system_memory_gb() -> f64 {
+    if let Ok(output) = tokio::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("hw.memsize")
+        .output()
+        .await
+    {
+        let out_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Ok(bytes) = out_str.parse::<u64>() {
+            let gb = (bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+            return (gb * 10.0).round() / 10.0;
+        }
+    }
+    36.0
+}
+
 /// [System Stats] GPU/RAM 상태 + 모델 포트 상태 + 활성 모델
 async fn system_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut free_pct = 46.0;
@@ -192,7 +211,7 @@ async fn system_stats_handler(State(state): State<AppState>) -> impl IntoRespons
         }
     }
     let used_pct = (100.0 - free_pct).round();
-    let total_gb = 36.0;
+    let total_gb = get_total_system_memory_gb().await;
     let used_gb = ((used_pct / 100.0) * total_gb * 10.0).round() / 10.0;
     let pressure_status = if used_pct < 75.0 {
         "normal"
@@ -229,6 +248,105 @@ async fn system_stats_handler(State(state): State<AppState>) -> impl IntoRespons
         "comfy_running": false,
         "is_locked": false
     }))
+}
+
+/// [System Models] 현재 등록된 모델 목록 및 활성 상태 반환
+async fn system_models_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let current_main = state.current_main_model.lock().await.clone();
+    let main_name = current_main.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+    let qwen_name = state.config.model_qwen_path.file_name().and_then(|n| n.to_str()).unwrap_or("Qwen3.8-27B").to_string();
+    let compact_name = state.config.model_compact_path.file_name().and_then(|n| n.to_str()).unwrap_or("Compact-MoE").to_string();
+
+    let mut models = vec![
+        json!({
+            "id": main_name,
+            "path": current_main.to_string_lossy(),
+            "role": "main",
+            "is_active": true,
+            "description": "Primary Reasoning & Coding Model"
+        }),
+    ];
+
+    if state.config.model_qwen_path != current_main {
+        models.push(json!({
+            "id": qwen_name,
+            "path": state.config.model_qwen_path.to_string_lossy(),
+            "role": "secondary",
+            "is_active": false,
+            "description": "Coding Model with MTP Speculative Decoding"
+        }));
+    }
+
+    models.push(json!({
+        "id": compact_name,
+        "path": state.config.model_compact_path.to_string_lossy(),
+        "role": "compact",
+        "is_active": false,
+        "description": "Context Compaction MoE Model (Port 1235)"
+    }));
+
+    Json(json!({
+        "models": models,
+        "active_main": main_name
+    }))
+}
+
+#[derive(Deserialize)]
+struct SwitchModelRequest {
+    model: String,
+}
+
+/// [System Switch Model] UI에서 요청 시 지정 모델로 원자적 스왑
+async fn handle_system_switch_model(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchModelRequest>,
+) -> impl IntoResponse {
+    let target_path = if req.model.contains("Qwen") || req.model.contains("27B") {
+        state.config.model_qwen_path.clone()
+    } else {
+        state.config.model_main_path.clone()
+    };
+
+    let mtp_opt = if target_path == state.config.model_qwen_path {
+        Some(state.config.model_mtp_path.clone())
+    } else {
+        None
+    };
+
+    let _lock = state.swap_lock.lock().await;
+    let mut active = state.last_active_model.lock().await;
+    let mut current_main = state.current_main_model.lock().await;
+
+    info!("🔄 Manual UI switch requested to {:?}", target_path.file_name().unwrap_or_default());
+    state.process_mgr.stop_compact().await;
+    state.process_mgr.stop_comfy().await;
+    state.process_mgr.stop_main().await;
+
+    let res = state.process_mgr.start_main(
+        &state.config.python_bin,
+        &target_path,
+        mtp_opt.as_deref(),
+        state.config.port_main_internal,
+        &state.config.prefill_step_size,
+        &state.config.log_dir,
+    ).await;
+
+    match res {
+        Ok(_) => {
+            *current_main = target_path.clone();
+            *active = "main".to_string();
+            (StatusCode::OK, Json(json!({
+                "status": "success",
+                "model": target_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown")
+            })))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                "status": "error",
+                "message": e.to_string()
+            })))
+        }
+    }
 }
 
 async fn health_check() -> impl IntoResponse {

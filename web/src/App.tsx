@@ -1,13 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Activity,
   Cpu,
   Layers,
-  Sparkles,
   Image as ImageIcon,
   Lock,
   Unlock,
-  Play,
   RotateCw,
   Terminal,
   Server,
@@ -15,7 +12,11 @@ import {
   CheckCircle2,
   AlertTriangle,
   RefreshCw,
-  Gauge
+  Gauge,
+  Copy,
+  Check,
+  FolderSync,
+  Play
 } from 'lucide-react';
 
 interface SystemStats {
@@ -39,6 +40,14 @@ interface SystemStats {
   is_locked?: boolean;
 }
 
+interface ModelItem {
+  id: string;
+  path: string;
+  role: string;
+  is_active: boolean;
+  description: string;
+}
+
 interface EventLog {
   id: string;
   time: string;
@@ -48,16 +57,19 @@ interface EventLog {
 
 export default function App() {
   const [stats, setStats] = useState<SystemStats | null>(null);
+  const [models, setModels] = useState<ModelItem[]>([]);
+  const [activeMainModel, setActiveMainModel] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionResult, setActionResult] = useState<string | null>(null);
+  const [copiedEndpoint, setCopiedEndpoint] = useState<boolean>(false);
   const [logs, setLogs] = useState<EventLog[]>([
     {
       id: 'init-1',
       time: new Date().toLocaleTimeString(),
       level: 'info',
-      message: '대시보드 초기화 완료 (Web UI connected to mlx-swapper Rust)',
+      message: 'Dashboard initialized (Connected to mlx-swapper Rust daemon)',
     },
   ]);
 
@@ -73,12 +85,20 @@ export default function App() {
     ]);
   };
 
-  // 실시간 상태 폴링
+  // 실시간 시스템 상태 및 모델 목록 폴링
   const fetchStats = useCallback(async () => {
     try {
-      const res = await fetch('/v1/system/stats');
-      if (!res.ok) {
-        // 백엔드 stats가 아직 없으면 /status 기반 폴백
+      const [statsRes, modelsRes] = await Promise.allSettled([
+        fetch('/v1/system/stats'),
+        fetch('/v1/system/models'),
+      ]);
+
+      if (statsRes.status === 'fulfilled' && statsRes.value.ok) {
+        const data: SystemStats = await statsRes.value.json();
+        setStats(data);
+        setError(null);
+      } else {
+        // Fallback to /status if /v1/system/stats isn't responding
         const statusRes = await fetch('/status');
         if (statusRes.ok) {
           const statusData = await statusRes.json();
@@ -102,16 +122,18 @@ export default function App() {
             comfy_running: false,
             is_locked: false,
           });
-          setError(null);
-          return;
         }
-        throw new Error(`HTTP ${res.status}`);
       }
-      const data: SystemStats = await res.json();
-      setStats(data);
-      setError(null);
+
+      if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) {
+        const mData = await modelsRes.value.json();
+        if (mData.models) {
+          setModels(mData.models);
+          setActiveMainModel(mData.active_main || '');
+        }
+      }
     } catch (err: any) {
-      setError(err.message || '서버 통신 실패');
+      setError(err.message || 'Server communication failed');
     } finally {
       setLoading(false);
     }
@@ -119,11 +141,36 @@ export default function App() {
 
   useEffect(() => {
     fetchStats();
-    const interval = setInterval(fetchStats, 1500); // 1.5초마다 깜빡임 없이 부드럽게 갱신
+    const interval = setInterval(fetchStats, 1500);
     return () => clearInterval(interval);
   }, [fetchStats]);
 
-  // 스왑 락 제어
+  // 모델 즉시 스왑 요청
+  const handleSwitchModel = async (modelId: string) => {
+    setActionLoading(`switch-${modelId}`);
+    addLog('swap', `🔄 Model switch requested: ${modelId}`);
+    try {
+      const res = await fetch('/v1/system/switch-model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        addLog('success', `✔ Model swapped successfully to ${data.model}`);
+        setActionResult(`Swapped to ${data.model}`);
+      } else {
+        addLog('warn', `Model switch error: ${data.message || 'Failed'}`);
+      }
+      fetchStats();
+    } catch (err: any) {
+      addLog('warn', `Switch request failed: ${err.message}`);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 스왑 락 토글
   const handleToggleLock = async () => {
     const isLocked = stats?.is_locked;
     const targetUrl = isLocked ? '/v1/swap/unlock' : '/v1/swap/lock';
@@ -132,53 +179,52 @@ export default function App() {
     try {
       const res = await fetch(targetUrl, { method: 'POST' });
       const json = await res.json();
-      addLog('swap', `스왑 락 변경: ${JSON.stringify(json)}`);
-      setActionResult(`${actionName} 완료`);
+      addLog('swap', `Swap Lock state changed: ${JSON.stringify(json)}`);
+      setActionResult(`${actionName} completed`);
       fetchStats();
     } catch (err: any) {
-      addLog('warn', `스왑 락 오류: ${err.message}`);
+      addLog('warn', `Swap lock error: ${err.message}`);
     } finally {
       setActionLoading(null);
     }
   };
 
-  // ComfyUI 단발 테스트 실행
+  // ComfyUI 단발 테스트
   const handleComfyTest = async () => {
-    if (!confirm('ComfyUI 테스트를 실행하시겠습니까? 메인 LLM이 일시 중지되고 VRAM이 ComfyUI에 할당됩니다.')) {
+    if (!confirm('Run ComfyUI test workflow? The main LLM will be safely paused to yield Metal VRAM.')) {
       return;
     }
     setActionLoading('comfy');
-    addLog('swap', '🎨 ComfyUI 온디맨드 스왑 시작: LLM 중지 -> ComfyUI 기동 요청');
+    addLog('swap', '🎨 ComfyUI On-demand Swap: Stopping LLM -> Launching ComfyUI');
     try {
       const res = await fetch('/v1/comfy/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 't2i',
-          prompt: 'A cute futuristic robot on Apple Silicon M5 Max desk, cyberpunk neon vibe',
+          prompt: 'A cute futuristic cybernetic robot on an Apple Silicon Mac Studio desk, neon aesthetic',
         }),
       });
       const data = await res.json();
       if (res.ok) {
-        addLog('success', `✔ ComfyUI 실행 성공! 결과 파일: ${data.files?.join(', ') || '생성 완료'}`);
-        setActionResult('ComfyUI 워크플로우 정상 완료!');
+        addLog('success', `✔ ComfyUI run finished! Saved image: ${data.images?.join(', ') || 'Complete'}`);
+        setActionResult('ComfyUI workflow finished successfully!');
       } else {
-        addLog('warn', `ComfyUI 실행 에러: ${data.error || '실패'}`);
+        addLog('warn', `ComfyUI run error: ${data.error || 'Failed'}`);
       }
       fetchStats();
     } catch (err: any) {
-      addLog('warn', `ComfyUI 통신 오류: ${err.message}`);
+      addLog('warn', `ComfyUI network error: ${err.message}`);
     } finally {
       setActionLoading(null);
     }
   };
 
-  // 포맷 헬퍼
-  const formatUptime = (secs: number) => {
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    const s = secs % 60;
-    return `${h}h ${m}m ${s}s`;
+  // 엔드포인트 클립보드 복사
+  const copyEndpoint = (url: string) => {
+    navigator.clipboard.writeText(url);
+    setCopiedEndpoint(true);
+    setTimeout(() => setCopiedEndpoint(false), 2000);
   };
 
   const memPct = stats?.system_memory.used_pct ?? 55;
@@ -192,7 +238,7 @@ export default function App() {
   return (
     <div style={{ maxWidth: '1280px', margin: '0 auto', padding: '32px 24px' }}>
       {/* ── Top Header Bar ─────────────────────────────────────────── */}
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '32px' }}>
+      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '28px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
           <div
             style={{
@@ -213,14 +259,14 @@ export default function App() {
               <h1 style={{ fontSize: '1.5rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
                 MLX Dynamic Swapper
               </h1>
-              <span className="badge badge-active">Apple Silicon M5 Max</span>
+              <span className="badge badge-active">Apple Silicon ({memTotalGb.toFixed(0)}GB)</span>
               <span className="badge badge-online">
                 <span className="pulse-dot pulse-green"></span>
                 {stats?.daemon.engine || 'Rust Native'}
               </span>
             </div>
             <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', marginTop: '2px' }}>
-              Zero-Copy Async SSE Proxy • Single-Occupancy Metal VRAM Swapping
+              Zero-OOM Dynamic Memory Swapper & AI Agent Gateway
             </p>
           </div>
         </div>
@@ -229,17 +275,57 @@ export default function App() {
           <button
             className="btn-action"
             onClick={() => fetchStats()}
-            title="즉시 새로고침"
+            title="Refresh now"
           >
             <RefreshCw size={16} />
-            새로고침
+            Refresh
           </button>
           <div style={{ textAlign: 'right', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
             <div>Daemon PID: <code>{stats?.daemon.pid || '-'}</code></div>
-            <div>Daemon RAM: <strong style={{ color: '#34d399' }}>{stats?.daemon.ram_mb || 4} MB</strong></div>
+            <div>Daemon RSS: <strong style={{ color: '#34d399' }}>{stats?.daemon.ram_mb || 4} MB</strong></div>
           </div>
         </div>
       </header>
+
+      {/* ── Quick Connect Banner (OpenAI URL Copy) ────────────────── */}
+      <div
+        className="glass-panel"
+        style={{
+          padding: '16px 20px',
+          marginBottom: '24px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          background: 'rgba(56, 189, 248, 0.05)',
+          borderColor: 'rgba(56, 189, 248, 0.2)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <Server size={20} color="#38bdf8" />
+          <div>
+            <div style={{ fontSize: '0.9rem', fontWeight: 600, color: '#f8fafc' }}>
+              OpenAI-Compatible Local Endpoint
+            </div>
+            <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+              Use with Cursor, Claude Code, Cline, LibreChat, or Open WebUI
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <code style={{ background: 'rgba(0,0,0,0.4)', padding: '6px 12px', borderRadius: '6px', fontSize: '0.85rem' }}>
+            http://127.0.0.1:1234/v1
+          </code>
+          <button
+            className="btn-action btn-primary"
+            style={{ padding: '6px 12px', fontSize: '0.85rem' }}
+            onClick={() => copyEndpoint('http://127.0.0.1:1234/v1')}
+          >
+            {copiedEndpoint ? <Check size={14} color="#34d399" /> : <Copy size={14} />}
+            {copiedEndpoint ? 'Copied!' : 'Copy URL'}
+          </button>
+        </div>
+      </div>
 
       {/* ── Grid Layout: Metrics & System Status ────────────────────── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(12, 1fr)', gap: '20px', marginBottom: '28px' }}>
@@ -248,7 +334,7 @@ export default function App() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <Gauge size={20} color="var(--accent-cyan)" />
-              <h2 style={{ fontSize: '1.1rem', fontWeight: 600 }}>통합 메모리 점유 현황 (Unified Memory)</h2>
+              <h2 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Apple Silicon Unified Memory</h2>
             </div>
             <span
               className={`badge ${
@@ -260,7 +346,7 @@ export default function App() {
                   memPct < 75 ? 'pulse-green' : memPct < 90 ? 'pulse-amber' : 'pulse-amber'
                 }`}
               ></span>
-              {memPct < 75 ? '쾌적 (Safe < 75%)' : memPct < 90 ? '주의 (Warning)' : '위험 (Near Swap)'}
+              {memPct < 75 ? 'Optimal (< 75% Green)' : memPct < 90 ? 'Warning' : 'Critical (Near Swap)'}
             </span>
           </div>
 
@@ -272,7 +358,7 @@ export default function App() {
               ({memUsedGb.toFixed(1)} GB / {memTotalGb.toFixed(1)} GB)
             </span>
             <span style={{ marginLeft: 'auto', fontSize: '0.85rem', color: '#34d399' }}>
-              스왑 발생 0% • Metal VRAM 안정 확보
+              Zero Disk Swap • Metal VRAM Protected
             </span>
           </div>
 
@@ -313,13 +399,13 @@ export default function App() {
             }}
           >
             <div>
-              <span style={{ color: 'var(--text-muted)' }}>스왑 정책:</span> 단일 점유(Single Occupancy)
+              <span style={{ color: 'var(--text-muted)' }}>Swap Policy:</span> Single Occupancy
             </div>
             <div>
-              <span style={{ color: 'var(--text-muted)' }}>스왑 시 VRAM 반환:</span> 100% POSIX 세션 회수
+              <span style={{ color: 'var(--text-muted)' }}>VRAM Reclamation:</span> 100% POSIX setsid + killpg
             </div>
             <div>
-              <span style={{ color: 'var(--text-muted)' }}>여유 공간:</span>{' '}
+              <span style={{ color: 'var(--text-muted)' }}>Available Headroom:</span>{' '}
               <strong style={{ color: '#f8fafc' }}>{(memTotalGb - memUsedGb).toFixed(1)} GB</strong>
             </div>
           </div>
@@ -330,15 +416,15 @@ export default function App() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <Server size={20} color="var(--accent-purple)" />
-              <h2 style={{ fontSize: '1.1rem', fontWeight: 600 }}>스왑 컨트롤 & 세션 제어</h2>
+              <h2 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Swap Session Controls</h2>
             </div>
             <span className={`badge ${stats?.is_locked ? 'badge-locked' : 'badge-online'}`}>
-              {stats?.is_locked ? '스왑 고정 (Locked)' : '동적 스왑 가용'}
+              {stats?.is_locked ? 'Swap Locked' : 'Dynamic Swap Ready'}
             </span>
           </div>
 
           <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '20px', lineHeight: 1.5 }}>
-            ComfyUI 이미지 생성이나 긴급 압축 등 특정 작업에 메모리를 독점할 때 수동으로 스왑을 제어할 수 있습니다.
+            Trigger manual swaps or execute on-demand image generation pipelines without triggering system OOMs.
           </p>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
@@ -350,7 +436,7 @@ export default function App() {
                 disabled={actionLoading !== null}
               >
                 {stats?.is_locked ? <Unlock size={16} /> : <Lock size={16} />}
-                {stats?.is_locked ? '스왑 락 해제 (Unlock)' : '현재 모델 고정 (Lock)'}
+                {stats?.is_locked ? 'Unlock Swap' : 'Lock Active Model'}
               </button>
 
               <button
@@ -360,14 +446,14 @@ export default function App() {
                 disabled={actionLoading !== null}
               >
                 <ImageIcon size={16} />
-                ComfyUI 온디맨드 런
+                ComfyUI On-Demand Run
               </button>
             </div>
 
             {actionLoading && (
               <div style={{ fontSize: '0.8rem', color: '#38bdf8', textAlign: 'center', marginTop: '4px' }}>
                 <RotateCw size={14} className="inline animate-spin mr-1" />
-                작업 처리 중... ({actionLoading})
+                Processing... ({actionLoading})
               </div>
             )}
             {actionResult && !actionLoading && (
@@ -379,14 +465,14 @@ export default function App() {
         </div>
       </div>
 
-      {/* ── Active 3-Layer Model Matrix ─────────────────────────────── */}
+      {/* ── Interactive Model Matrix & Switcher ─────────────────────── */}
       <h2 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
         <Layers size={22} color="var(--accent-cyan)" />
-        3-Track 하이브리드 레이어 매트릭스
+        Active Model Matrix & One-Click Switcher
       </h2>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '20px', marginBottom: '28px' }}>
-        {/* Layer 1: Qwen 3.8 27B MTP (Main) */}
+        {/* Layer 1: Main Primary Model */}
         <div
           className={`glass-panel ${isMainActive ? 'glass-panel-glow' : ''}`}
           style={{
@@ -399,38 +485,44 @@ export default function App() {
             <span className="badge badge-active">Track 1 • Main LLM</span>
             <span className={`badge ${isMainActive ? 'badge-online' : 'badge-idle'}`}>
               <span className={`pulse-dot ${isMainActive ? 'pulse-green' : 'pulse-gray'}`}></span>
-              {isMainActive ? 'ACTIVE (VRAM 점유)' : 'STANDBY'}
+              {isMainActive ? 'ACTIVE (VRAM Claimed)' : 'STANDBY'}
             </span>
           </div>
 
           <h3 style={{ fontSize: '1.15rem', fontWeight: 700, marginBottom: '4px' }}>
-            Qwen 3.8 27B MTP
+            {activeMainModel || 'DeepSeek-R1-14B / Qwen 27B'}
           </h3>
           <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '16px' }}>
-            지능 담당 • 아키텍처/디버깅 • MTP Multi-Token 43 tok/s
+            Primary Reasoning & Coding Engine • Fast Inference
           </p>
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.8rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.8rem', marginBottom: '16px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>엔드포인트 포트:</span>
-              <code>1234 (백엔드: 18234)</code>
+              <span style={{ color: 'var(--text-muted)' }}>Port Binding:</span>
+              <code>1234 (Backend: 18234)</code>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>Thinking 모드:</span>
-              <strong style={{ color: '#38bdf8' }}>medium (~1.5s 즉시 반응)</strong>
+              <span style={{ color: 'var(--text-muted)' }}>Thinking Effort:</span>
+              <strong style={{ color: '#38bdf8' }}>medium (~1.5s TTFT)</strong>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
               <span style={{ color: 'var(--text-muted)' }}>Context Length:</span>
               <span>65,536 tokens</span>
             </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>VRAM 점유:</span>
-              <span>~17.2 GB (4-bit quant)</span>
-            </div>
           </div>
+
+          <button
+            className="btn-action"
+            style={{ width: '100%', justifyContent: 'center' }}
+            onClick={() => handleSwitchModel(activeMainModel)}
+            disabled={actionLoading !== null || isMainActive}
+          >
+            <Play size={14} />
+            {isMainActive ? 'Currently Active' : 'Activate Main Model'}
+          </button>
         </div>
 
-        {/* Layer 2: Gemma 4 26B MoE (Compact) */}
+        {/* Layer 2: Compaction / Secondary Model */}
         <div
           className={`glass-panel ${isCompactActive ? 'glass-panel-glow' : ''}`}
           style={{
@@ -440,10 +532,10 @@ export default function App() {
           }}
         >
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
-            <span className="badge badge-warning">Track 2 • Fast Compactor</span>
+            <span className="badge badge-warning">Track 2 • Context Compactor</span>
             <span className={`badge ${isCompactActive ? 'badge-online' : 'badge-idle'}`}>
               <span className={`pulse-dot ${isCompactActive ? 'pulse-green' : 'pulse-gray'}`}></span>
-              {isCompactActive ? 'COMPACTING' : 'STANDBY'}
+              {isCompactActive ? 'COMPACTING' : 'ON-DEMAND'}
             </span>
           </div>
 
@@ -451,112 +543,122 @@ export default function App() {
             Gemma 4 26B-A4B MoE
           </h3>
           <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '16px' }}>
-            초고속 세션 압축 • 98 tok/s • 구조화 제약 주입
+            Context Summarization • 4-Section Density Compactor
           </p>
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.8rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.8rem', marginBottom: '16px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>엔드포인트 포트:</span>
-              <code>1235 (백엔드: 18235)</code>
+              <span style={{ color: 'var(--text-muted)' }}>Dedicated Port:</span>
+              <code>1235 (Backend: 18235)</code>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>트리거 시점:</span>
-              <span>세션 컨텍스트 만료 압축 시</span>
+              <span style={{ color: 'var(--text-muted)' }}>Compaction Speed:</span>
+              <strong style={{ color: '#c084fc' }}>~5-8s latency</strong>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>처리 속도:</span>
-              <strong style={{ color: '#c084fc' }}>98 tokens/sec</strong>
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>캐시 격리:</span>
-              <span>압축 전용 격리 스왑</span>
+              <span style={{ color: 'var(--text-muted)' }}>Trigger:</span>
+              <span>Context Threshold &gt; 26K</span>
             </div>
           </div>
+
+          <button
+            className="btn-action"
+            style={{ width: '100%', justifyContent: 'center' }}
+            disabled
+          >
+            Automatic On-Demand
+          </button>
         </div>
 
-        {/* Layer 3: ComfyUI (Image Gen) */}
+        {/* Layer 3: ComfyUI Diffusion Pipeline */}
         <div
           className={`glass-panel ${isComfyActive ? 'glass-panel-glow' : ''}`}
           style={{
             padding: '20px',
             position: 'relative',
-            borderColor: isComfyActive ? 'rgba(52, 211, 153, 0.4)' : 'var(--border-card)',
+            borderColor: isComfyActive ? 'rgba(244, 63, 94, 0.4)' : 'var(--border-card)',
           }}
         >
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
-            <span className="badge badge-online">Track 3 • Image Studio</span>
+            <span className="badge badge-error">Track 3 • Image Pipeline</span>
             <span className={`badge ${isComfyActive ? 'badge-online' : 'badge-idle'}`}>
               <span className={`pulse-dot ${isComfyActive ? 'pulse-green' : 'pulse-gray'}`}></span>
-              {isComfyActive ? 'GENERATING' : 'IDLE'}
+              {isComfyActive ? 'GENERATING' : 'IDLE (0 MB VRAM)'}
             </span>
           </div>
 
           <h3 style={{ fontSize: '1.15rem', fontWeight: 700, marginBottom: '4px' }}>
-            ComfyUI Engine
+            ComfyUI (Qwen-Image / Flux)
           </h3>
           <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '16px' }}>
-            FLUX / SDXL 생성 • 온디맨드 스왑 & 자동 수거
+            Text-to-Image & Image-to-Image Editing
           </p>
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.8rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.8rem', marginBottom: '16px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>API 엔드포인트:</span>
-              <code>POST /v1/comfy/run</code>
+              <span style={{ color: 'var(--text-muted)' }}>API Endpoint:</span>
+              <code>/v1/comfy/run</code>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>기동 포트:</span>
-              <code>8188 (내부 실행)</code>
+              <span style={{ color: 'var(--text-muted)' }}>Pipeline VRAM:</span>
+              <span>~18-20 GB (Zero Leak)</span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>스왑 프로토콜:</span>
-              <span>LLM 자동 일시중지 & 복원</span>
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>결과 반환:</span>
-              <span>JSON + 이미지 절대 경로</span>
+              <span style={{ color: 'var(--text-muted)' }}>Workflow:</span>
+              <span>Synchronous HTTP Task</span>
             </div>
           </div>
+
+          <button
+            className="btn-action btn-primary"
+            style={{ width: '100%', justifyContent: 'center' }}
+            onClick={handleComfyTest}
+            disabled={actionLoading !== null}
+          >
+            <ImageIcon size={14} />
+            Test Image Run
+          </button>
         </div>
       </div>
 
-      {/* ── Realtime Event Logs & Console ────────────────────────────── */}
-      <div className="glass-panel" style={{ padding: '20px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Terminal size={18} color="var(--accent-cyan)" />
-            <h3 style={{ fontSize: '0.95rem', fontWeight: 600 }}>실시간 스왑 및 이벤트 콘솔 (No-Flicker Stream)</h3>
+      {/* ── Live Event Stream & Logs ─────────────────────────────────── */}
+      <div className="glass-panel" style={{ padding: '24px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <Terminal size={20} color="var(--accent-cyan)" />
+            <h2 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Real-Time Swap & Process Logs</h2>
           </div>
-          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-            최근 {logs.length}개 이벤트
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+            Showing last {logs.length} events
           </span>
         </div>
 
         <div
           style={{
-            background: 'rgba(11, 15, 23, 0.8)',
-            border: '1px solid rgba(255, 255, 255, 0.05)',
-            borderRadius: '10px',
-            padding: '12px 16px',
-            maxHeight: '180px',
+            background: 'rgba(0, 0, 0, 0.4)',
+            borderRadius: '8px',
+            padding: '16px',
+            maxHeight: '220px',
             overflowY: 'auto',
-            fontFamily: 'Fira Code, monospace',
+            fontFamily: 'var(--font-mono)',
             fontSize: '0.8rem',
             lineHeight: 1.6,
           }}
         >
           {logs.map((log) => (
-            <div key={log.id} style={{ display: 'flex', gap: '12px' }}>
-              <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>[{log.time}]</span>
+            <div key={log.id} style={{ display: 'flex', gap: '12px', marginBottom: '4px' }}>
+              <span style={{ color: 'var(--text-muted)' }}>[{log.time}]</span>
               <span
                 style={{
                   color:
-                    log.level === 'swap'
-                      ? '#38bdf8'
-                      : log.level === 'success'
+                    log.level === 'success'
                       ? '#34d399'
+                      : log.level === 'swap'
+                      ? '#38bdf8'
                       : log.level === 'warn'
-                      ? '#fbbf24'
+                      ? '#f59e0b'
                       : '#94a3b8',
+                  fontWeight: log.level === 'swap' ? 600 : 400,
                 }}
               >
                 {log.message}
