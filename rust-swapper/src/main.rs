@@ -76,12 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 3. 서버 시작 시 Main 모델 자동 기동
+    // 리스너를 열기 전에 swap_lock 을 잡아 두고 백그라운드 태스크로 넘깁니다.
+    // 프리워밍 도중 들어온 요청은 이 락에서 기다리므로, 아직 포트가 안 열린 모델에 붙어
+    // 502 → Self-Heal 재시작으로 로딩 중인 모델을 죽였다 다시 띄우는 일이 없습니다.
     info!("⚡ Pre-warming Main Model on background: {:?}", initial_main_model.file_name().unwrap_or_default());
+    let prewarm_guard = state.swap_lock.clone().lock_owned().await;
     let pm = process_mgr.clone();
     let conf = config.clone();
     let init_model = initial_main_model.clone();
     let init_mtp = initial_mtp.clone();
     tokio::spawn(async move {
+        let _prewarm_guard = prewarm_guard;
         if let Err(e) = pm
             .start_main(
                 &conf.python_bin,
