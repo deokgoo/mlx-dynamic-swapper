@@ -323,7 +323,9 @@ async fn handle_comfy_run(
     state.process_mgr.stop_main().await;
     state.process_mgr.stop_compact().await;
 
-    state
+    // ComfyUI 기동이 실패해도 여기서 바로 return 하지 않습니다.
+    // 아래 3단계(ComfyUI 정리 -> 메인 모델 복원)를 반드시 거쳐야 메인 모델이 꺼진 채 남지 않습니다.
+    let start_res = state
         .process_mgr
         .start_comfy(
             &state.config.comfy_python_bin,
@@ -333,18 +335,25 @@ async fn handle_comfy_run(
             &state.config.comfy_output_dir,
             &state.config.log_dir,
         )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .await;
 
     // 2. 워크플로우 실행 및 완료 대기
-    let run_res = comfy::execute_workflow(
-        &state.http_client,
-        state.config.comfy_port,
-        &state.config.comfy_output_dir,
-        wf_payload,
-        timeout,
-    )
-    .await;
+    let run_res = match start_res {
+        Ok(()) => {
+            comfy::execute_workflow(
+                &state.http_client,
+                state.config.comfy_port,
+                &state.config.comfy_output_dir,
+                wf_payload,
+                timeout,
+            )
+            .await
+        }
+        Err(e) => {
+            warn!("🎨 ComfyUI failed to start: {}", e);
+            Err(e)
+        }
+    };
 
     // 3. ComfyUI 종료 -> 메인 모델 복원
     info!("🎨 ComfyUI workflow finished. Stopping ComfyUI and restoring Main model...");
@@ -686,6 +695,61 @@ mod http_tests {
             current_main_model: Arc::new(Mutex::new(conf.model_main_path.clone())),
             pipeline: Arc::new(pipeline::RequestPipeline::build_default()),
         }
+    }
+
+    fn unused_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// `--port` 인자만 읽어 그 포트를 열고 대기하는 가짜 python (mlx_vlm.server 대역)
+    fn write_fake_python(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-python");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             while [ $# -gt 0 ]; do [ \"$1\" = \"--port\" ] && PORT=\"$2\"; shift; done\n\
+             exec /usr/bin/python3 -c \"import socket,sys,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(sys.argv[1])));s.listen();time.sleep(600)\" \"$PORT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_comfy_start_failure_restores_main_model() {
+        let dir = std::env::temp_dir().join(format!("mlx-swapper-comfy-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut state = setup_test_app();
+        state.config.log_dir = dir.clone();
+        state.config.python_bin = write_fake_python(&dir);
+        state.config.comfy_python_bin = dir.join("missing-comfy-python");
+        state.config.port_main_internal = unused_port();
+        state.config.comfy_port = unused_port();
+        let process_mgr = state.process_mgr.clone();
+
+        let response = create_main_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/comfy/run")
+                    .body(Body::from(r#"{"action":"raw","workflow":{}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let main_restored = process_mgr.is_main_running().await;
+        process_mgr.stop_main().await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(main_restored, "main model must be restored after ComfyUI fails to start");
     }
 
     #[tokio::test]
