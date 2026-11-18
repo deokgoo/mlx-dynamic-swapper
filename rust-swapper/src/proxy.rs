@@ -24,6 +24,7 @@ pub async fn forward_request(
     target_port: u16,
     headers: HeaderMap,
     payload: Option<Value>,
+    raw_body: axum::body::Bytes,
 ) -> Result<Response, (StatusCode, String)> {
     let target_url = format!("http://127.0.0.1:{}{}", target_port, uri_path);
 
@@ -38,8 +39,11 @@ pub async fn forward_request(
         }
     }
 
+    // JSON 은 파이프라인을 거친 값을, 그 밖의 본문(multipart·form·바이너리 등)은 받은 그대로 넘깁니다.
     if let Some(json_body) = payload {
         req_builder = req_builder.json(&json_body);
+    } else if !raw_body.is_empty() {
+        req_builder = req_builder.body(raw_body);
     }
 
     let upstream_resp = req_builder
@@ -69,4 +73,33 @@ pub async fn forward_request(
     response_builder
         .body(body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::post;
+    use axum::Router;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn forwards_non_json_body_unchanged() {
+        // 받은 본문을 그대로 돌려주는 업스트림
+        let app = Router::new().route("/echo", post(|body: axum::body::Bytes| async move { body }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let raw = axum::body::Bytes::from_static(b"--boundary\r\nnot json\r\n--boundary--\r\n");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "multipart/form-data; boundary=boundary".parse().unwrap());
+
+        let resp = forward_request(&Client::new(), Method::POST, "/echo", port, headers, None, raw.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let echoed = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(echoed, raw);
+    }
 }

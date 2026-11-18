@@ -537,6 +537,7 @@ async fn handle_main_proxy(
         state.config.port_main_internal,
         headers.clone(),
         payload.clone(),
+        body.clone(),
     )
     .await;
 
@@ -575,6 +576,7 @@ async fn handle_main_proxy(
                 state.config.port_main_internal,
                 headers,
                 payload,
+                body,
             )
             .await
         }
@@ -632,6 +634,7 @@ async fn handle_compact_proxy(
         state.config.port_compact_internal,
         headers.clone(),
         payload.clone(),
+        body.clone(),
     )
     .await;
 
@@ -660,6 +663,7 @@ async fn handle_compact_proxy(
                 state.config.port_compact_internal,
                 headers,
                 payload,
+                body,
             )
             .await
         }
