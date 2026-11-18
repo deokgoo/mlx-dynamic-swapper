@@ -114,15 +114,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         _ = axum::serve(main_listener, main_router) => {},
         _ = axum::serve(compact_listener, compact_router) => {},
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             info!("🛑 Shutdown signal received! Cleaning up all child processes...");
             process_mgr.stop_main().await;
             process_mgr.stop_compact().await;
+            process_mgr.stop_comfy().await;
             info!("✔ Clean exit. Metal VRAM 100% returned.");
         }
     }
 
     Ok(())
+}
+
+/// SIGINT(Ctrl+C) 와 SIGTERM(launchctl stop/unload) 을 모두 종료 신호로 받습니다.
+/// 자식 프로세스는 setsid 로 별도 세션에 있으므로, 여기서 정리하지 않으면 고아로 남아 Metal 메모리와 포트를 계속 점유합니다.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
+    }
 }
 
 pub fn create_main_router(state: AppState) -> Router {
